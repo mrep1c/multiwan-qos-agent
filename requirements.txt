@@ -1,0 +1,5 @@
+psutil>=5.9.0
+requests>=2.32.4
+pystray>=0.19.0
+Pillow>=11.3.0
+pywin32>=306

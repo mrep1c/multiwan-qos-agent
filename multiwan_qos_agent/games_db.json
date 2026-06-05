@@ -1,0 +1,140 @@
+{
+  "games": [
+    {
+      "name": "Valorant",
+      "executables": [
+        "VALORANT-Win64-Shipping.exe",
+        "VALORANT.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Counter-Strike 2",
+      "executables": [
+        "cs2.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Fortnite",
+      "executables": [
+        "FortniteClient-Win64-Shipping.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Apex Legends",
+      "executables": [
+        "r5apex.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Call of Duty",
+      "executables": [
+        "cod.exe",
+        "ModernWarfare.exe",
+        "BlackOpsColdWar.exe",
+        "cod23-cod.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "League of Legends",
+      "executables": [
+        "League of Legends.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Dota 2",
+      "executables": [
+        "dota2.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Overwatch 2",
+      "executables": [
+        "Overwatch.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Rocket League",
+      "executables": [
+        "RocketLeague.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "PUBG",
+      "executables": [
+        "TslGame.exe",
+        "PUBG-Win64-Shipping.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Rainbow Six Siege",
+      "executables": [
+        "RainbowSix.exe",
+        "RainbowSix_BE.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Destiny 2",
+      "executables": [
+        "destiny2.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Minecraft",
+      "executables": [
+        "javaw.exe",
+        "Minecraft.Windows.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Escape from Tarkov",
+      "executables": [
+        "EscapeFromTarkov.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Hunt Showdown",
+      "executables": [
+        "HuntGame.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "DayZ",
+      "executables": [
+        "DayZ_x64.exe",
+        "DayZ_BE.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "Arma 3",
+      "executables": [
+        "arma3_x64.exe",
+        "arma3.exe"
+      ],
+      "proto": "udp"
+    },
+    {
+      "name": "GTA V Online",
+      "executables": [
+        "GTA5.exe",
+        "PlayGTAV.exe"
+      ],
+      "proto": "udp"
+    }
+  ]
+}
