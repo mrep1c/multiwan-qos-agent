@@ -36,6 +36,7 @@ SUPPORTED_DSCP_VALUES = {item["value"] for item in DSCP_CLASSES}
 LOCAL_TAGGING_MODE_LIVE_FLOWS = "live_flows"
 LOCAL_TAGGING_MODE_ALL_UDP = "all_udp"
 LOCAL_TAGGING_MODES = {LOCAL_TAGGING_MODE_LIVE_FLOWS, LOCAL_TAGGING_MODE_ALL_UDP}
+LOCAL_TAGGING_MODE_MIGRATION_VERSION = 1
 LOCAL_TAGGING_RULE_GLOBAL = "global"
 LOCAL_TAGGING_RULE_ENABLED = "enabled"
 LOCAL_TAGGING_RULE_DISABLED = "disabled"
@@ -53,7 +54,8 @@ DEFAULT_CONFIG = {
     "heartbeat_interval": 30,  # seconds
     "dscp_value": DEFAULT_DSCP_VALUE,  # EF (Expedited Forwarding)
     "local_tagging_enabled": True,
-    "local_tagging_mode": LOCAL_TAGGING_MODE_LIVE_FLOWS,
+    "local_tagging_mode": LOCAL_TAGGING_MODE_ALL_UDP,
+    "local_tagging_mode_migration": LOCAL_TAGGING_MODE_MIGRATION_VERSION,
     "auto_start": True,
     "log_level": "INFO",
 }
@@ -95,7 +97,7 @@ def normalize_local_tagging_mode(value):
     value = str(value or "").strip().lower()
     if value in LOCAL_TAGGING_MODES:
         return value
-    return LOCAL_TAGGING_MODE_LIVE_FLOWS
+    return LOCAL_TAGGING_MODE_ALL_UDP
 
 
 def local_tagging_mode_label(value):
@@ -106,7 +108,7 @@ def local_tagging_mode_label(value):
 
 
 def local_tagging_mode_from_label(label):
-    for value in (LOCAL_TAGGING_MODE_LIVE_FLOWS, LOCAL_TAGGING_MODE_ALL_UDP):
+    for value in (LOCAL_TAGGING_MODE_ALL_UDP, LOCAL_TAGGING_MODE_LIVE_FLOWS):
         if label == local_tagging_mode_label(value):
             return value
     return normalize_local_tagging_mode(label)
@@ -114,8 +116,8 @@ def local_tagging_mode_from_label(label):
 
 def local_tagging_mode_options():
     return [
-        local_tagging_mode_label(LOCAL_TAGGING_MODE_LIVE_FLOWS),
         local_tagging_mode_label(LOCAL_TAGGING_MODE_ALL_UDP),
+        local_tagging_mode_label(LOCAL_TAGGING_MODE_LIVE_FLOWS),
     ]
 
 
@@ -271,12 +273,16 @@ def load_config():
     migrate_legacy_files()
     config_path = get_config_path()
     config = dict(DEFAULT_CONFIG)
+    loaded_saved_config = False
     saved_has_local_tagging_mode = False
+    saved_has_local_tagging_mode_migration = False
 
     if os.path.exists(config_path):
         try:
             saved = _read_json_file(config_path)
+            loaded_saved_config = True
             saved_has_local_tagging_mode = "local_tagging_mode" in saved
+            saved_has_local_tagging_mode_migration = "local_tagging_mode_migration" in saved
             legacy_https_without_tls_flag = (
                 "insecure_tls" not in saved and
                 str(saved.get("router_ip", "")).strip().startswith("https://")
@@ -295,6 +301,11 @@ def load_config():
     if not saved_has_local_tagging_mode and legacy_live_flow_mode is not None:
         config["local_tagging_mode"] = normalize_local_tagging_mode(bool(legacy_live_flow_mode))
     config["local_tagging_mode"] = normalize_local_tagging_mode(config.get("local_tagging_mode"))
+    if loaded_saved_config and not saved_has_local_tagging_mode_migration:
+        if config["local_tagging_mode"] == LOCAL_TAGGING_MODE_LIVE_FLOWS:
+            logger.info("Migrating local Windows DSCP tagging default to all-UDP mode")
+            config["local_tagging_mode"] = LOCAL_TAGGING_MODE_ALL_UDP
+        config["local_tagging_mode_migration"] = LOCAL_TAGGING_MODE_MIGRATION_VERSION
     return config
 
 
@@ -306,6 +317,7 @@ def save_config(config):
     config_to_save["dscp_value"] = normalize_dscp_value(config_to_save.get("dscp_value"))
     config_to_save["local_tagging_enabled"] = bool(config_to_save.get("local_tagging_enabled", True))
     config_to_save["local_tagging_mode"] = normalize_local_tagging_mode(config_to_save.get("local_tagging_mode"))
+    config_to_save["local_tagging_mode_migration"] = LOCAL_TAGGING_MODE_MIGRATION_VERSION
     config_to_save.pop("local_live_flow_policies", None)
     if "api_key" in config_to_save and config_to_save["api_key"]:
         config_to_save["api_key"] = _encrypt_api_key(config_to_save["api_key"])

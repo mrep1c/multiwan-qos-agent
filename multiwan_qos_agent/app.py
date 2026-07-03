@@ -63,6 +63,7 @@ class AgentState:
         self.game_rules = cfg.load_game_rules()
         self.settings_open = False
         self.shutdown_cleanup_done = False
+        self.sync_requested = False
 
     def get_snapshot(self):
         with self.lock:
@@ -100,7 +101,7 @@ def _build_policy_specs(
     detected,
     connections,
     local_tagging_enabled=True,
-    local_tagging_mode=cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS,
+    local_tagging_mode=cfg.LOCAL_TAGGING_MODE_ALL_UDP,
     game_rules=None,
 ):
     specs = []
@@ -602,7 +603,12 @@ def monitor_loop(state):
         # Sleep in small increments so we can stop quickly
         sleep_ticks = max(1, int(next_sleep * 2))
         for _ in range(sleep_ticks):
-            if not state.running:
+            with state.lock:
+                should_stop = not state.running
+                should_sync = bool(state.sync_requested)
+                if should_sync:
+                    state.sync_requested = False
+            if should_stop or should_sync:
                 break
             time.sleep(0.5)
 
@@ -684,6 +690,8 @@ def show_custom_games(state, parent):
         def set_games(games):
             with state.lock:
                 state.user_games = games
+                state.sync_requested = True
+                state.last_sync_msg = "Game list changed; syncing"
             cfg.save_user_games(games)
 
         def get_rules():
@@ -694,6 +702,8 @@ def show_custom_games(state, parent):
             sanitized = cfg.sanitize_game_rules(rules)
             with state.lock:
                 state.game_rules = sanitized
+                state.sync_requested = True
+                state.last_sync_msg = "Game rules changed; syncing"
             cfg.save_game_rules(sanitized)
 
         def game_entries():
@@ -916,6 +926,7 @@ class DashboardWindow:
             new_config["dscp_value"] = new_value
             self.state.config = new_config
             self.state.last_sync_msg = "DSCP changed; syncing"
+            self.state.sync_requested = True
 
         if cfg.save_config(new_config):
             with self.state.lock:
@@ -1272,6 +1283,8 @@ def show_settings(state, parent):
 
             with state.lock:
                 state.config = cfg.load_config()
+                state.sync_requested = True
+                state.last_sync_msg = "Settings changed; syncing"
 
             status_var.set(f"Saved to {cfg.get_config_path()}")
             messagebox.showinfo("MultiWAN QoS Agent", "Settings saved!", parent=root)

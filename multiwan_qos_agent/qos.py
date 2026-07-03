@@ -270,7 +270,9 @@ def build_policy_specs(game_name, exe_name, ports, remote_ip=None, remote_port=N
             )
             return []
 
-        src_port = _normalize_port(local_port)
+        # Keep exact mode anchored on the remote endpoint. Game-side UDP source
+        # ports can churn and make Windows policy matching miss active traffic.
+        src_port = None
         return [{
             "name": _policy_name(
                 game_name,
@@ -307,8 +309,6 @@ def _policy_match_description(spec):
     parts = [f"dst={spec.get('dst_prefix')}"]
     if spec.get("dst_port"):
         parts.append(f"dst_port={spec.get('dst_port')}")
-    if spec.get("src_port"):
-        parts.append(f"src_port={spec.get('src_port')}")
     return ", ".join(parts)
 
 
@@ -326,8 +326,6 @@ def _create_policy(spec, dscp_value):
         parts.append(f"-IPDstPrefixMatchCondition {_ps_quote(spec['dst_prefix'])}")
     if spec.get("dst_port"):
         parts.append(f"-IPDstPortMatchCondition {int(spec['dst_port'])}")
-    if spec.get("src_port"):
-        parts.append(f"-IPSrcPortMatchCondition {int(spec['src_port'])}")
     parts.extend([
         f"-DSCPAction {dscp_value}",
         "-NetworkProfile All",

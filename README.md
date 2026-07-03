@@ -14,8 +14,9 @@ The router endpoint is:
 
 - Detects active game processes from the built-in game database and custom
   user entries.
-- Applies Windows QoS policies for selected DSCP tagging, with an option to
-  mark only selected live flows on the PC.
+- Applies Windows QoS policies for local DSCP tagging. The default marks all
+  UDP traffic from detected game executables, with an optional stricter mode for
+  selected live flows.
 - Uses UDP flow telemetry and psutil connection inspection to identify live
   remote game endpoints.
 - Syncs active game connection metadata to the OpenWrt router.
@@ -88,7 +89,7 @@ artifact.
 Current asset:
 
 ```text
-MultiWAN-QoS-Agent-v1.0.3-windows-x64.exe
+MultiWAN-QoS-Agent-v1.0.4-windows-x64.exe
 ```
 
 Run the EXE as administrator. Windows may show a SmartScreen warning because
@@ -100,7 +101,8 @@ First setup:
 1. Enter the router IP address, for example `192.168.1.1`.
 2. Paste the API key from LuCI.
 3. Choose the DSCP class.
-4. Set `Enable local Windows DSCP tagging` and the local tagging mode.
+4. Set `Enable local Windows DSCP tagging` and the local tagging mode. Use the
+   default all-UDP mode for the most stable local game tagging.
 5. Save settings.
 6. Start a supported game and check the Live Dashboard.
 
@@ -170,7 +172,7 @@ Run PowerShell as administrator when testing DSCP policy creation.
 The Windows build output is created under `dist\`.
 
 GitHub Actions also builds the EXE automatically on pushes to `main`, on
-manual workflow runs, and on version tags such as `v1.0.3`. Version tags attach
+manual workflow runs, and on version tags such as `v1.0.4`. Version tags attach
 the EXE to the matching GitHub Release.
 
 ## Troubleshooting
