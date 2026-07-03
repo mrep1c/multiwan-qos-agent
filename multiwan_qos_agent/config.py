@@ -2,8 +2,10 @@
 
 import logging
 import base64
+import hashlib
 import json
 import os
+import re
 import shutil
 
 try:
@@ -31,6 +33,17 @@ DSCP_CLASSES = [
 ]
 DEFAULT_DSCP_VALUE = 46
 SUPPORTED_DSCP_VALUES = {item["value"] for item in DSCP_CLASSES}
+LOCAL_TAGGING_MODE_LIVE_FLOWS = "live_flows"
+LOCAL_TAGGING_MODE_ALL_UDP = "all_udp"
+LOCAL_TAGGING_MODES = {LOCAL_TAGGING_MODE_LIVE_FLOWS, LOCAL_TAGGING_MODE_ALL_UDP}
+LOCAL_TAGGING_RULE_GLOBAL = "global"
+LOCAL_TAGGING_RULE_ENABLED = "enabled"
+LOCAL_TAGGING_RULE_DISABLED = "disabled"
+LOCAL_TAGGING_RULES = {
+    LOCAL_TAGGING_RULE_GLOBAL,
+    LOCAL_TAGGING_RULE_ENABLED,
+    LOCAL_TAGGING_RULE_DISABLED,
+}
 
 DEFAULT_CONFIG = {
     "router_ip": "",
@@ -39,7 +52,8 @@ DEFAULT_CONFIG = {
     "setup_complete": False,
     "heartbeat_interval": 30,  # seconds
     "dscp_value": DEFAULT_DSCP_VALUE,  # EF (Expedited Forwarding)
-    "local_live_flow_policies": True,
+    "local_tagging_enabled": True,
+    "local_tagging_mode": LOCAL_TAGGING_MODE_LIVE_FLOWS,
     "auto_start": True,
     "log_level": "INFO",
 }
@@ -73,6 +87,91 @@ def dscp_value_from_label(label):
 
 def dscp_options():
     return [dscp_label(item["value"]) for item in DSCP_CLASSES]
+
+
+def normalize_local_tagging_mode(value):
+    if isinstance(value, bool):
+        return LOCAL_TAGGING_MODE_LIVE_FLOWS if value else LOCAL_TAGGING_MODE_ALL_UDP
+    value = str(value or "").strip().lower()
+    if value in LOCAL_TAGGING_MODES:
+        return value
+    return LOCAL_TAGGING_MODE_LIVE_FLOWS
+
+
+def local_tagging_mode_label(value):
+    value = normalize_local_tagging_mode(value)
+    if value == LOCAL_TAGGING_MODE_ALL_UDP:
+        return "All UDP from detected game executable"
+    return "Selected live flows only"
+
+
+def local_tagging_mode_from_label(label):
+    for value in (LOCAL_TAGGING_MODE_LIVE_FLOWS, LOCAL_TAGGING_MODE_ALL_UDP):
+        if label == local_tagging_mode_label(value):
+            return value
+    return normalize_local_tagging_mode(label)
+
+
+def local_tagging_mode_options():
+    return [
+        local_tagging_mode_label(LOCAL_TAGGING_MODE_LIVE_FLOWS),
+        local_tagging_mode_label(LOCAL_TAGGING_MODE_ALL_UDP),
+    ]
+
+
+def normalize_local_tagging_rule(value):
+    value = str(value or "").strip().lower()
+    if value in LOCAL_TAGGING_RULES:
+        return value
+    return LOCAL_TAGGING_RULE_GLOBAL
+
+
+def local_tagging_rule_label(value):
+    value = normalize_local_tagging_rule(value)
+    if value == LOCAL_TAGGING_RULE_ENABLED:
+        return "Enable local tagging"
+    if value == LOCAL_TAGGING_RULE_DISABLED:
+        return "Disable local tagging"
+    return "Use global setting"
+
+
+def local_tagging_rule_from_label(label):
+    for value in (
+        LOCAL_TAGGING_RULE_GLOBAL,
+        LOCAL_TAGGING_RULE_ENABLED,
+        LOCAL_TAGGING_RULE_DISABLED,
+    ):
+        if label == local_tagging_rule_label(value):
+            return value
+    return normalize_local_tagging_rule(label)
+
+
+def local_tagging_rule_options():
+    return [
+        local_tagging_rule_label(LOCAL_TAGGING_RULE_GLOBAL),
+        local_tagging_rule_label(LOCAL_TAGGING_RULE_ENABLED),
+        local_tagging_rule_label(LOCAL_TAGGING_RULE_DISABLED),
+    ]
+
+
+def _slug(value):
+    value = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    return value or "game"
+
+
+def game_id(game, source="game"):
+    explicit = str(game.get("id", "") if isinstance(game, dict) else "").strip().lower()
+    if explicit:
+        return explicit
+    if not isinstance(game, dict):
+        game = {}
+    executables = game.get("executables", [])
+    if isinstance(executables, str):
+        executables = [executables]
+    seed_items = [str(item).strip().lower() for item in executables if str(item).strip()]
+    seed = "|".join(sorted(seed_items)) or str(game.get("name", "game")).strip().lower()
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
+    return f"{_slug(source)}_{digest}"
 
 
 def get_config_dir():
@@ -129,6 +228,11 @@ def get_user_games_path():
     return os.path.join(get_config_dir(), "user_games.json")
 
 
+def get_game_rules_path():
+    """Get the path to per-game local tagging overrides."""
+    return os.path.join(get_config_dir(), "game_rules.json")
+
+
 def get_legacy_config_path():
     """Get the previous AppData config path."""
     return os.path.join(get_legacy_config_dir(), "config.json")
@@ -167,10 +271,12 @@ def load_config():
     migrate_legacy_files()
     config_path = get_config_path()
     config = dict(DEFAULT_CONFIG)
+    saved_has_local_tagging_mode = False
 
     if os.path.exists(config_path):
         try:
             saved = _read_json_file(config_path)
+            saved_has_local_tagging_mode = "local_tagging_mode" in saved
             legacy_https_without_tls_flag = (
                 "insecure_tls" not in saved and
                 str(saved.get("router_ip", "")).strip().startswith("https://")
@@ -183,8 +289,12 @@ def load_config():
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Failed to load config, using defaults: %s", e)
 
+    legacy_live_flow_mode = config.get("local_live_flow_policies")
     config["dscp_value"] = normalize_dscp_value(config.get("dscp_value"))
-    config["local_live_flow_policies"] = bool(config.get("local_live_flow_policies", True))
+    config["local_tagging_enabled"] = bool(config.get("local_tagging_enabled", True))
+    if not saved_has_local_tagging_mode and legacy_live_flow_mode is not None:
+        config["local_tagging_mode"] = normalize_local_tagging_mode(bool(legacy_live_flow_mode))
+    config["local_tagging_mode"] = normalize_local_tagging_mode(config.get("local_tagging_mode"))
     return config
 
 
@@ -194,7 +304,9 @@ def save_config(config):
     
     config_to_save = dict(config)
     config_to_save["dscp_value"] = normalize_dscp_value(config_to_save.get("dscp_value"))
-    config_to_save["local_live_flow_policies"] = bool(config_to_save.get("local_live_flow_policies", True))
+    config_to_save["local_tagging_enabled"] = bool(config_to_save.get("local_tagging_enabled", True))
+    config_to_save["local_tagging_mode"] = normalize_local_tagging_mode(config_to_save.get("local_tagging_mode"))
+    config_to_save.pop("local_live_flow_policies", None)
     if "api_key" in config_to_save and config_to_save["api_key"]:
         config_to_save["api_key"] = _encrypt_api_key(config_to_save["api_key"])
         
@@ -222,7 +334,7 @@ def load_user_games():
 
 
 def sanitize_user_games(games):
-    """Return custom games without legacy fallback-port fields."""
+    """Return custom games without legacy fallback-port or rule fields."""
     sanitized = []
     if not isinstance(games, list):
         return sanitized
@@ -234,6 +346,7 @@ def sanitize_user_games(games):
         if isinstance(executables, str):
             executables = [item.strip() for item in executables.split(",") if item.strip()]
         entry = {
+            "id": game_id(game, "custom"),
             "name": game.get("name", "Custom"),
             "executables": list(executables),
             "proto": "udp",
@@ -241,6 +354,53 @@ def sanitize_user_games(games):
         sanitized.append(entry)
 
     return sanitized
+
+
+def sanitize_game_rules(rules):
+    """Return per-game rule overrides keyed by stable game id."""
+    sanitized = {}
+    if not isinstance(rules, dict):
+        return sanitized
+
+    for raw_game_id, raw_rule in rules.items():
+        game_key = str(raw_game_id or "").strip().lower()
+        if not game_key:
+            continue
+        if isinstance(raw_rule, dict):
+            local_tagging = raw_rule.get("local_tagging", LOCAL_TAGGING_RULE_GLOBAL)
+        else:
+            local_tagging = raw_rule
+        local_tagging = normalize_local_tagging_rule(local_tagging)
+        if local_tagging == LOCAL_TAGGING_RULE_GLOBAL:
+            continue
+        sanitized[game_key] = {"local_tagging": local_tagging}
+
+    return sanitized
+
+
+def load_game_rules():
+    """Load per-game local tagging rule overrides."""
+    path = get_game_rules_path()
+    if os.path.exists(path):
+        try:
+            return sanitize_game_rules(_read_json_file(path))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load game rules: %s", e)
+    return {}
+
+
+def save_game_rules(rules):
+    """Save per-game local tagging rule overrides."""
+    path = get_game_rules_path()
+    sanitized = sanitize_game_rules(rules)
+    try:
+        with open(path, "w") as f:
+            json.dump(sanitized, f, indent=2)
+        logger.info("Game rules saved (%d overrides)", len(sanitized))
+        return True
+    except OSError as e:
+        logger.error("Failed to save game rules: %s", e)
+        return False
 
 
 def save_user_games(games):

@@ -88,7 +88,7 @@ artifact.
 Current asset:
 
 ```text
-MultiWAN-QoS-Agent-v1.0.2-windows-x64.exe
+MultiWAN-QoS-Agent-v1.0.3-windows-x64.exe
 ```
 
 Run the EXE as administrator. Windows may show a SmartScreen warning because
@@ -100,8 +100,7 @@ First setup:
 1. Enter the router IP address, for example `192.168.1.1`.
 2. Paste the API key from LuCI.
 3. Choose the DSCP class.
-4. Leave `Mark only selected live flows on this PC` enabled for exact local
-   DSCP policies, or disable it to mark all UDP from detected game executables.
+4. Set `Enable local Windows DSCP tagging` and the local tagging mode.
 5. Save settings.
 6. Start a supported game and check the Live Dashboard.
 
@@ -119,24 +118,35 @@ Custom games:
 %APPDATA%\MultiWAN QoS Agent\user_games.json
 ```
 
+Game rule overrides:
+
+```text
+%APPDATA%\MultiWAN QoS Agent\game_rules.json
+```
+
 Log file:
 
 ```text
 %APPDATA%\MultiWAN QoS Agent\agent.log
 ```
 
-## Custom Games
+## Game Rules
 
-Use the Custom Games editor to add processes that are not in the built-in game
-database. Each entry should include:
+Use the Game Rules editor to control local Windows DSCP tagging for built-in
+and custom games. Built-in games are read-only but can still have rule
+overrides. Custom entries should include:
 
 - display name,
 - executable name,
-- expected protocol,
-- optional local or remote ports.
+- expected protocol.
 
-After saving custom games, restart detection from the tray app or restart the
-agent.
+Each game can use the global local-tagging setting, explicitly enable local
+tagging, or disable local tagging. Disabling local tagging for a game does not
+stop detection or router rule sync. If global local tagging is disabled in
+Settings, no per-game rule creates local Windows QoS policies.
+
+After changing custom games or game rules, restart detection from the tray app
+or restart the agent.
 
 ## Run From Source
 
@@ -160,7 +170,7 @@ Run PowerShell as administrator when testing DSCP policy creation.
 The Windows build output is created under `dist\`.
 
 GitHub Actions also builds the EXE automatically on pushes to `main`, on
-manual workflow runs, and on version tags such as `v1.0.2`. Version tags attach
+manual workflow runs, and on version tags such as `v1.0.3`. Version tags attach
 the EXE to the matching GitHub Release.
 
 ## Troubleshooting
@@ -186,7 +196,7 @@ If the Live Dashboard is empty:
 
 - Start a supported game.
 - Confirm the game is using network traffic.
-- Add the game manually in Custom Games if needed.
+- Add the game manually in Game Rules if needed.
 - Confirm the router can receive agent updates.
 
 ## Uninstall

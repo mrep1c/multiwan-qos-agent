@@ -60,6 +60,7 @@ class AgentState:
         self.config = cfg.load_config()
         self.game_db = monitor.load_game_database()
         self.user_games = cfg.load_user_games()
+        self.game_rules = cfg.load_game_rules()
         self.settings_open = False
         self.shutdown_cleanup_done = False
 
@@ -76,14 +77,40 @@ class AgentState:
                 "rules_count": self.rules_count,
                 "configured": cfg.is_configured(self.config),
                 "dscp_value": cfg.normalize_dscp_value(self.config.get("dscp_value")),
-                "local_live_flow_policies": bool(self.config.get("local_live_flow_policies", True)),
+                "local_tagging_enabled": bool(self.config.get("local_tagging_enabled", True)),
+                "local_tagging_mode": cfg.normalize_local_tagging_mode(self.config.get("local_tagging_mode")),
             }
 
 
-def _build_policy_specs(detected, connections, local_live_flow_policies=True):
-    specs = []
+def _local_tagging_rule(game_data, game_rules):
+    game_info = game_data.get("game_info", {})
+    game_key = cfg.game_id(game_info, "builtin")
+    rule = game_rules.get(game_key, {})
+    return cfg.normalize_local_tagging_rule(rule.get("local_tagging") if isinstance(rule, dict) else rule)
 
-    if local_live_flow_policies:
+
+def _game_allows_local_tagging(game_data, game_rules, local_tagging_enabled):
+    if not local_tagging_enabled:
+        return False
+    rule = _local_tagging_rule(game_data, game_rules)
+    return rule != cfg.LOCAL_TAGGING_RULE_DISABLED
+
+
+def _build_policy_specs(
+    detected,
+    connections,
+    local_tagging_enabled=True,
+    local_tagging_mode=cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS,
+    game_rules=None,
+):
+    specs = []
+    game_rules = game_rules or {}
+    local_tagging_mode = cfg.normalize_local_tagging_mode(local_tagging_mode)
+
+    if not local_tagging_enabled:
+        return specs
+
+    if local_tagging_mode == cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS:
         for conn in connections:
             if not conn.get("selected", True):
                 continue
@@ -93,6 +120,8 @@ def _build_policy_specs(detected, connections, local_live_flow_policies=True):
             game_name = conn.get("game")
             game_data = detected.get(game_name)
             if not game_data:
+                continue
+            if not _game_allows_local_tagging(game_data, game_rules, local_tagging_enabled):
                 continue
 
             remote_ip = conn.get("remote_ip")
@@ -112,6 +141,8 @@ def _build_policy_specs(detected, connections, local_live_flow_policies=True):
         return specs
 
     for game_name, game_data in detected.items():
+        if not _game_allows_local_tagging(game_data, game_rules, local_tagging_enabled):
+            continue
         specs.extend(qos.build_policy_specs(game_name, game_data["exe_name"], None))
 
     return specs
@@ -336,11 +367,13 @@ def monitor_loop(state):
             with state.lock:
                 current_config = dict(state.config)
                 user_games = list(state.user_games)
+                game_rules = dict(state.game_rules)
 
             interval = current_config.get("heartbeat_interval", 30)
             next_sleep = interval
             dscp_value = cfg.normalize_dscp_value(current_config.get("dscp_value"))
-            local_live_flow_policies = bool(current_config.get("local_live_flow_policies", True))
+            local_tagging_enabled = bool(current_config.get("local_tagging_enabled", True))
+            local_tagging_mode = cfg.normalize_local_tagging_mode(current_config.get("local_tagging_mode"))
             insecure_tls = bool(current_config.get("insecure_tls", False))
 
             if not cfg.is_configured(current_config):
@@ -383,13 +416,19 @@ def monitor_loop(state):
                 state.flow_candidates = flow_candidates
                 state.flow_status = flow_collector.status()
 
-            desired_specs = _build_policy_specs(detected, connections, local_live_flow_policies)
+            desired_specs = _build_policy_specs(
+                detected,
+                connections,
+                local_tagging_enabled,
+                local_tagging_mode,
+                game_rules,
+            )
             desired_signature = _policy_signature(desired_specs, dscp_value)
             if transitioned_to_idle or desired_signature != last_policy_signature:
                 policy_reason = "game stop" if transitioned_to_idle else (
-                    ("live-flow update" if local_live_flow_policies else "game update")
+                    ("live-flow update" if local_tagging_mode == cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS else "game update")
                     if desired_specs else
-                    ("live-flow cleanup" if local_live_flow_policies and detected else "startup cleanup")
+                    ("local-tagging cleanup" if detected else "startup cleanup")
                 )
                 if _sync_windows_policies(desired_specs, dscp_value, policy_reason):
                     last_policy_signature = desired_signature
@@ -587,11 +626,11 @@ def create_icon(color="gray"):
 
 
 def show_custom_games(state, parent):
-    """Show a simple editor for user-defined game executable entries."""
+    """Show the unified game rules and custom game editor."""
     def _run():
         root = tk.Toplevel(parent)
-        root.title("MultiWAN QoS Agent - Custom Games")
-        root.geometry("720x420")
+        root.title("MultiWAN QoS Agent - Game Rules")
+        root.geometry("820x480")
         root.resizable(True, True)
 
         main = ttk.Frame(root, padding=12)
@@ -603,20 +642,38 @@ def show_custom_games(state, parent):
         right = ttk.Frame(main)
         right.pack(side="right", fill="both", expand=True)
 
-        ttk.Label(left, text="Custom Games").pack(anchor="w")
-        game_list = tk.Listbox(left, height=14)
+        ttk.Label(left, text="Game Rules").pack(anchor="w")
+        game_list = tk.Listbox(left, height=16, width=34)
         game_list.pack(fill="both", expand=True, pady=(4, 0))
 
+        source_var = tk.StringVar()
         name_var = tk.StringVar()
         exe_var = tk.StringVar()
+        rule_var = tk.StringVar(master=root, value=cfg.local_tagging_rule_label(cfg.LOCAL_TAGGING_RULE_GLOBAL))
         status_var = tk.StringVar()
+        entries_state = {"items": [], "selected": None}
 
+        ttk.Label(right, text="Type").pack(anchor="w")
+        source_entry = ttk.Entry(right, textvariable=source_var)
+        source_entry.pack(fill="x", pady=(2, 8))
+        source_entry.configure(state="disabled")
         ttk.Label(right, text="Name").pack(anchor="w")
-        ttk.Entry(right, textvariable=name_var).pack(fill="x", pady=(2, 8))
+        name_entry = ttk.Entry(right, textvariable=name_var)
+        name_entry.pack(fill="x", pady=(2, 8))
 
         ttk.Label(right, text="Executable names").pack(anchor="w")
-        ttk.Entry(right, textvariable=exe_var).pack(fill="x", pady=(2, 4))
+        exe_entry = ttk.Entry(right, textvariable=exe_var)
+        exe_entry.pack(fill="x", pady=(2, 4))
         ttk.Label(right, text="Comma-separated, e.g. game.exe, launcher.exe").pack(anchor="w")
+
+        ttk.Label(right, text="Local Windows DSCP tagging").pack(anchor="w", pady=(10, 0))
+        rule_combo = ttk.Combobox(
+            right,
+            textvariable=rule_var,
+            values=cfg.local_tagging_rule_options(),
+            state="readonly",
+        )
+        rule_combo.pack(fill="x", pady=(2, 0))
 
         ttk.Label(right, textvariable=status_var, foreground="gray").pack(anchor="w", pady=(12, 4))
 
@@ -629,23 +686,86 @@ def show_custom_games(state, parent):
                 state.user_games = games
             cfg.save_user_games(games)
 
-        def refresh_list(selected_index=None):
+        def get_rules():
+            with state.lock:
+                return dict(state.game_rules)
+
+        def set_rules(rules):
+            sanitized = cfg.sanitize_game_rules(rules)
+            with state.lock:
+                state.game_rules = sanitized
+            cfg.save_game_rules(sanitized)
+
+        def game_entries():
+            entries = []
+            with state.lock:
+                builtin_games = list(state.game_db)
+            for game in builtin_games:
+                entries.append({
+                    "id": cfg.game_id(game, "builtin"),
+                    "source": "builtin",
+                    "index": None,
+                    "game": game,
+                })
+            for index, game in enumerate(get_games()):
+                entries.append({
+                    "id": cfg.game_id(game, "custom"),
+                    "source": "custom",
+                    "index": index,
+                    "game": game,
+                })
+            return entries
+
+        def rule_for(game_key):
+            rule = get_rules().get(game_key, {})
+            return cfg.normalize_local_tagging_rule(rule.get("local_tagging") if isinstance(rule, dict) else rule)
+
+        def entry_label(entry):
+            game = entry["game"]
+            source = "Built-in" if entry["source"] == "builtin" else "Custom"
+            rule = rule_for(entry["id"])
+            suffix = ""
+            if rule != cfg.LOCAL_TAGGING_RULE_GLOBAL:
+                suffix = f" - {cfg.local_tagging_rule_label(rule)}"
+            return f"{game.get('name', 'Game')} [{source}]{suffix}"
+
+        def set_custom_editable(enabled):
+            state_name = "normal" if enabled else "disabled"
+            name_entry.configure(state=state_name)
+            exe_entry.configure(state=state_name)
+            delete_button.configure(state=state_name if enabled else "disabled")
+
+        def refresh_list(selected_id=None):
+            entries = game_entries()
+            entries_state["items"] = entries
             game_list.delete(0, tk.END)
-            for game in get_games():
-                game_list.insert(tk.END, game.get("name", "Custom"))
-            if selected_index is not None and game_list.size() > selected_index:
+            selected_index = None
+            for index, entry in enumerate(entries):
+                game_list.insert(tk.END, entry_label(entry))
+                if selected_id is not None and entry["id"] == selected_id:
+                    selected_index = index
+            if selected_index is not None:
                 game_list.selection_set(selected_index)
                 game_list.activate(selected_index)
+                load_selected()
+            elif selected_id is None:
+                new_entry()
 
         def load_selected(_event=None):
             selection = game_list.curselection()
             if not selection:
                 return
-            game = get_games()[selection[0]]
+            entry = entries_state["items"][selection[0]]
+            entries_state["selected"] = entry
+            game = entry["game"]
+            source_var.set("Built-in game" if entry["source"] == "builtin" else "Custom game")
             name_var.set(game.get("name", ""))
             exe_var.set(", ".join(game.get("executables", [])))
+            rule_var.set(cfg.local_tagging_rule_label(rule_for(entry["id"])))
+            set_custom_editable(entry["source"] == "custom")
+            status_var.set("")
 
-        def validate_form():
+        def validate_form(existing_id=None):
             name = name_var.get().strip()
             executables = [
                 exe.strip()
@@ -661,55 +781,84 @@ def show_custom_games(state, parent):
                 if not exe.lower().endswith(".exe"):
                     return None, f"Executable must end with .exe: {exe}"
 
-            return {
+            entry = {
                 "name": name,
                 "executables": executables,
                 "proto": "udp",
-            }, ""
+            }
+            if existing_id:
+                entry["id"] = existing_id
+            else:
+                entry["id"] = cfg.game_id(entry, "custom")
+            return entry, ""
+
+        def save_rule(game_key):
+            rules = get_rules()
+            rule = cfg.local_tagging_rule_from_label(rule_var.get())
+            if rule == cfg.LOCAL_TAGGING_RULE_GLOBAL:
+                rules.pop(game_key, None)
+            else:
+                rules[game_key] = {"local_tagging": rule}
+            set_rules(rules)
 
         def save_entry():
-            entry, error = validate_form()
+            current = entries_state.get("selected")
+
+            if current and current["source"] == "builtin":
+                save_rule(current["id"])
+                refresh_list(current["id"])
+                status_var.set("Saved")
+                return
+
+            existing_id = current["id"] if current and current["source"] == "custom" else None
+            entry, error = validate_form(existing_id)
             if error:
                 status_var.set(error)
                 return
 
             games = get_games()
-            selection = game_list.curselection()
-            if selection:
-                index = selection[0]
-                games[index] = entry
+            if current and current["source"] == "custom" and current["index"] is not None:
+                games[current["index"]] = entry
             else:
-                index = len(games)
                 games.append(entry)
 
             set_games(games)
-            refresh_list(index)
+            save_rule(entry["id"])
+            refresh_list(entry["id"])
             status_var.set("Saved")
 
         def new_entry():
             game_list.selection_clear(0, tk.END)
+            entries_state["selected"] = {"id": None, "source": "custom", "index": None, "game": {}}
+            source_var.set("Custom game")
             name_var.set("")
             exe_var.set("")
+            rule_var.set(cfg.local_tagging_rule_label(cfg.LOCAL_TAGGING_RULE_GLOBAL))
+            set_custom_editable(True)
             status_var.set("")
 
         def delete_entry():
-            selection = game_list.curselection()
-            if not selection:
-                status_var.set("Select an entry to delete")
+            current = entries_state.get("selected")
+            if not current or current["source"] != "custom" or current["index"] is None:
+                status_var.set("Select a custom entry to delete")
                 return
-            index = selection[0]
             games = get_games()
-            del games[index]
+            del games[current["index"]]
             set_games(games)
+            rules = get_rules()
+            if current["id"]:
+                rules.pop(current["id"], None)
+            set_rules(rules)
             new_entry()
             refresh_list()
             status_var.set("Deleted")
 
         buttons = ttk.Frame(right)
         buttons.pack(fill="x", pady=(12, 0))
-        ttk.Button(buttons, text="New", command=new_entry).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="New Custom", command=new_entry).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Save", command=save_entry).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="Delete", command=delete_entry).pack(side="left", padx=(0, 6))
+        delete_button = ttk.Button(buttons, text="Delete", command=delete_entry)
+        delete_button.pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Close", command=root.destroy).pack(side="right")
 
         game_list.bind("<<ListboxSelect>>", load_selected)
@@ -825,7 +974,7 @@ class DashboardWindow:
         self.lbl_rules.pack(side="left", padx=(0, 20))
         self.lbl_detector = ttk.Label(status_frame, text="Detector: starting", style="Dark.TLabel")
         self.lbl_detector.pack(side="left", padx=(0, 20))
-        ttk.Button(status_frame, text="Custom Games",
+        ttk.Button(status_frame, text="Game Rules",
                    command=self.on_custom_games).pack(side="left", padx=(0, 20))
         self.lbl_time = ttk.Label(status_frame, text="", style="Dark.TLabel")
         self.lbl_time.pack(side="right")
@@ -984,7 +1133,7 @@ def show_settings(state, parent):
     def _run():
         root = tk.Toplevel(parent)
         root.title("MultiWAN QoS Agent — Settings")
-        root.geometry("460x390")
+        root.geometry("460x430")
         root.resizable(False, False)
         root.update_idletasks()
         root.tk.call("tk::PlaceWindow", root._w, "center")
@@ -1039,15 +1188,30 @@ def show_settings(state, parent):
             command=mark_tls_manual,
         ).pack(anchor="w", pady=(6, 0))
 
-        flow_policy_var = tk.BooleanVar(
+        tagging_enabled_var = tk.BooleanVar(
             master=root,
-            value=bool(state.config.get("local_live_flow_policies", True)),
+            value=bool(state.config.get("local_tagging_enabled", True)),
         )
         ttk.Checkbutton(
             frame,
-            text="Mark only selected live flows on this PC",
-            variable=flow_policy_var,
+            text="Enable local Windows DSCP tagging",
+            variable=tagging_enabled_var,
         ).pack(anchor="w", pady=(8, 0))
+
+        mode_f = ttk.Frame(frame)
+        mode_f.pack(fill="x", pady=(8, 0))
+        ttk.Label(mode_f, text="Local tagging mode:", width=18).pack(side="left")
+        mode_var = tk.StringVar(
+            master=root,
+            value=cfg.local_tagging_mode_label(state.config.get("local_tagging_mode")),
+        )
+        ttk.Combobox(
+            mode_f,
+            textvariable=mode_var,
+            values=cfg.local_tagging_mode_options(),
+            state="readonly",
+            width=28,
+        ).pack(side="left", fill="x", expand=True)
 
         # Auto-start
         auto_start_value = is_autostart_enabled()
@@ -1097,7 +1261,8 @@ def show_settings(state, parent):
             new_config["router_ip"] = router_ip
             new_config["api_key"] = api_key
             new_config["insecure_tls"] = bool(tls_var.get())
-            new_config["local_live_flow_policies"] = bool(flow_policy_var.get())
+            new_config["local_tagging_enabled"] = bool(tagging_enabled_var.get())
+            new_config["local_tagging_mode"] = cfg.local_tagging_mode_from_label(mode_var.get())
             new_config["auto_start"] = auto_start
             new_config["setup_complete"] = True
 
@@ -1394,7 +1559,7 @@ def main():
         ui.call("settings", ui.show_settings)
 
     def on_custom_games(icon, item):
-        ui.call("custom games", ui.show_custom_games)
+        ui.call("game rules", ui.show_custom_games)
 
     def on_quit(icon, item):
         if shutdown_requested.is_set():
@@ -1443,7 +1608,7 @@ def main():
         pystray.MenuItem("MultiWAN QoS Agent", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Live Dashboard", safe_callback("dashboard", on_dashboard), default=True),
-        pystray.MenuItem("Custom Games", safe_callback("custom games", on_custom_games)),
+        pystray.MenuItem("Game Rules", safe_callback("game rules", on_custom_games)),
         pystray.MenuItem("Settings", safe_callback("settings", on_settings)),
         pystray.MenuItem("Start with Windows", safe_callback("auto-start", on_autostart), checked=autostart_checked),
         pystray.Menu.SEPARATOR,
