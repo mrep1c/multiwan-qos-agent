@@ -83,7 +83,7 @@ https://github.com/mrep1c/multiwan-qos-agent/releases
 Current asset:
 
 ```text
-MultiWAN-QoS-Agent-v1.0.0-windows-x64.exe
+MultiWAN-QoS-Agent-v1.0.1-windows-x64.exe
 ```
 
 Run the EXE as administrator. Windows may show a SmartScreen warning because

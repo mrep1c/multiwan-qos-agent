@@ -42,10 +42,7 @@ def _endpoint_urls(router_ip):
             return [ip]
         return [f"{ip}/cgi-bin/multiwan-qos-agent"]
 
-    return [
-        f"http://{ip}/cgi-bin/multiwan-qos-agent",
-        f"https://{ip}/cgi-bin/multiwan-qos-agent",
-    ]
+    return [f"https://{ip}/cgi-bin/multiwan-qos-agent"]
 
 
 def _response_message(response, default=None):
