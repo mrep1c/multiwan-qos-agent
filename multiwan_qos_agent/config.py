@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "setup_complete": False,
     "heartbeat_interval": 30,  # seconds
     "dscp_value": DEFAULT_DSCP_VALUE,  # EF (Expedited Forwarding)
+    "local_live_flow_policies": True,
     "auto_start": True,
     "log_level": "INFO",
 }
@@ -183,6 +184,7 @@ def load_config():
             logger.warning("Failed to load config, using defaults: %s", e)
 
     config["dscp_value"] = normalize_dscp_value(config.get("dscp_value"))
+    config["local_live_flow_policies"] = bool(config.get("local_live_flow_policies", True))
     return config
 
 
@@ -192,6 +194,7 @@ def save_config(config):
     
     config_to_save = dict(config)
     config_to_save["dscp_value"] = normalize_dscp_value(config_to_save.get("dscp_value"))
+    config_to_save["local_live_flow_policies"] = bool(config_to_save.get("local_live_flow_policies", True))
     if "api_key" in config_to_save and config_to_save["api_key"]:
         config_to_save["api_key"] = _encrypt_api_key(config_to_save["api_key"])
         

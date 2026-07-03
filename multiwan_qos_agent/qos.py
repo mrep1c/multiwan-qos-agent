@@ -7,6 +7,7 @@ before it reaches the router.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -97,11 +98,64 @@ def _validate_exe_name(exe_name):
     return bool(re.match(r"^[\w\-. ]+\.exe$", exe_name or "", re.IGNORECASE))
 
 
+def _normalize_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _normalize_ip_prefix(value):
+    value = str(value or "").strip()
+    if not value or value.lower() in ("any", "*"):
+        return None
+    try:
+        if "/" in value:
+            return str(ipaddress.ip_network(value, strict=False))
+        ip = ipaddress.ip_address(value)
+        prefix_len = 32 if ip.version == 4 else 128
+        return f"{ip}/{prefix_len}"
+    except ValueError:
+        return None
+
+
 def _exe_matches_policy(policy_app, exe_name):
     policy_app = str(policy_app or "").replace("/", "\\").lower()
     exe_name = str(exe_name or "").lower()
     policy_exe = policy_app.rsplit("\\", 1)[-1]
     return policy_app == exe_name or policy_exe == exe_name
+
+
+def _active_prefix_matches_spec(policy, spec):
+    spec_prefix = spec.get("dst_prefix")
+    active_prefix = _normalize_ip_prefix(policy.get("dst_prefix"))
+    if spec_prefix is None:
+        return active_prefix is None
+    return active_prefix == spec_prefix
+
+
+def _has_port_match(value):
+    return _normalize_port(value) is not None
+
+
+def _active_port_matches_spec(policy, prefix, spec_port):
+    exact = policy.get(f"{prefix}_port")
+    start = policy.get(f"{prefix}_port_start")
+    end = policy.get(f"{prefix}_port_end")
+
+    if spec_port is None:
+        return not any(_has_port_match(value) for value in (exact, start, end))
+
+    active_exact = _normalize_port(exact)
+    if active_exact is not None:
+        return active_exact == spec_port
+
+    active_start = _normalize_port(start)
+    active_end = _normalize_port(end)
+    return active_start == spec_port and active_end == spec_port
 
 
 def _policy_matches_spec(policy, spec, dscp_value):
@@ -118,6 +172,9 @@ def _policy_matches_spec(policy, spec, dscp_value):
         _exe_matches_policy(policy.get("app"), spec.get("exe"))
         and protocol in ("udp", "17")
         and active_dscp == int(dscp_value)
+        and _active_prefix_matches_spec(policy, spec)
+        and _active_port_matches_spec(policy, "dst", spec.get("dst_port"))
+        and _active_port_matches_spec(policy, "src", spec.get("src_port"))
     )
 
 
@@ -176,20 +233,60 @@ def ports_to_ranges(ports):
     return ranges
 
 
-def _policy_name(game_name, exe_name, start_port=None, end_port=None):
+def _policy_name(
+    game_name,
+    exe_name,
+    start_port=None,
+    end_port=None,
+    dst_prefix=None,
+    dst_port=None,
+    src_port=None,
+):
     safe_game = _sanitize_policy_name(game_name)
     key = f"{game_name}|{exe_name}|udp"
-    if start_port and end_port:
+    if dst_prefix or dst_port or src_port:
+        key = f"{key}|flow|{dst_prefix or ''}|{dst_port or ''}|{src_port or ''}"
+    elif start_port and end_port:
         key = f"{key}|{start_port}-{end_port}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
     return f"{safe_game}_{digest}"
 
 
-def build_policy_specs(game_name, exe_name, ports):
+def build_policy_specs(game_name, exe_name, ports, remote_ip=None, remote_port=None, local_port=None):
     """Create a desired UDP-only QoS policy spec for one game executable."""
     if not _validate_exe_name(exe_name):
         logger.error("Invalid executable name: %s", exe_name)
         return []
+
+    if remote_ip or remote_port:
+        dst_prefix = _normalize_ip_prefix(remote_ip)
+        dst_port = _normalize_port(remote_port)
+        if not dst_prefix or not dst_port:
+            logger.warning(
+                "Skipping QoS live-flow policy for %s: invalid remote endpoint %s:%s",
+                game_name,
+                remote_ip,
+                remote_port,
+            )
+            return []
+
+        src_port = _normalize_port(local_port)
+        return [{
+            "name": _policy_name(
+                game_name,
+                exe_name,
+                dst_prefix=dst_prefix,
+                dst_port=dst_port,
+                src_port=src_port,
+            ),
+            "game": game_name,
+            "exe": exe_name,
+            "start_port": None,
+            "end_port": None,
+            "dst_prefix": dst_prefix,
+            "dst_port": dst_port,
+            "src_port": src_port,
+        }]
 
     return [{
         "name": _policy_name(game_name, exe_name),
@@ -197,29 +294,55 @@ def build_policy_specs(game_name, exe_name, ports):
         "exe": exe_name,
         "start_port": None,
         "end_port": None,
+        "dst_prefix": None,
+        "dst_port": None,
+        "src_port": None,
     }]
+
+
+def _policy_match_description(spec):
+    if not spec.get("dst_prefix"):
+        return "all UDP"
+
+    parts = [f"dst={spec.get('dst_prefix')}"]
+    if spec.get("dst_port"):
+        parts.append(f"dst_port={spec.get('dst_port')}")
+    if spec.get("src_port"):
+        parts.append(f"src_port={spec.get('src_port')}")
+    return ", ".join(parts)
 
 
 def _create_policy(spec, dscp_value):
     policy_name = spec["name"]
     exe_name = spec["exe"]
+    match_desc = _policy_match_description(spec)
 
-    create_cmd = (
-        f"New-NetQosPolicy -Name {_ps_quote(policy_name)} "
-        f"-AppPathNameMatchCondition {_ps_quote(exe_name)} "
-        f"-IPProtocolMatchCondition UDP "
-        f"-DSCPAction {dscp_value} "
-        f"-NetworkProfile All "
-        f"-PolicyStore {POLICY_STORE} "
-        f"-Confirm:$false"
-    )
+    parts = [
+        f"New-NetQosPolicy -Name {_ps_quote(policy_name)}",
+        f"-AppPathNameMatchCondition {_ps_quote(exe_name)}",
+        "-IPProtocolMatchCondition UDP",
+    ]
+    if spec.get("dst_prefix"):
+        parts.append(f"-IPDstPrefixMatchCondition {_ps_quote(spec['dst_prefix'])}")
+    if spec.get("dst_port"):
+        parts.append(f"-IPDstPortMatchCondition {int(spec['dst_port'])}")
+    if spec.get("src_port"):
+        parts.append(f"-IPSrcPortMatchCondition {int(spec['src_port'])}")
+    parts.extend([
+        f"-DSCPAction {dscp_value}",
+        "-NetworkProfile All",
+        f"-PolicyStore {POLICY_STORE}",
+        "-Confirm:$false",
+    ])
+    create_cmd = " ".join(parts)
 
     success, output = _run_powershell(create_cmd)
     if success:
         logger.info(
-            "Created UDP QoS policy: %s (exe=%s, all UDP, DSCP=%d)",
+            "Created UDP QoS policy: %s (exe=%s, %s, DSCP=%d)",
             policy_name,
             exe_name,
+            match_desc,
             dscp_value,
         )
         return True
@@ -237,9 +360,10 @@ def _create_policy(spec, dscp_value):
             retry_success, retry_output = _run_powershell(create_cmd)
             if retry_success:
                 logger.info(
-                    "Recreated UDP QoS policy: %s (exe=%s, all UDP, DSCP=%d)",
+                    "Recreated UDP QoS policy: %s (exe=%s, %s, DSCP=%d)",
                     policy_name,
                     exe_name,
+                    match_desc,
                     dscp_value,
                 )
                 return True
@@ -308,7 +432,7 @@ def sync_qos_policies(desired_specs, dscp_value=46):
             if _policy_matches_spec(active_policy, spec, dscp_value):
                 continue
             logger.info(
-                "Recreating QoS policy %s because existing policy does not match desired exe/protocol/DSCP",
+                "Recreating QoS policy %s because existing policy does not match desired match conditions",
                 policy_name,
             )
             if not remove_qos_policy_by_name(active_policy.get("name", policy_name)):
@@ -371,8 +495,10 @@ def get_active_policies():
         f'Get-NetQosPolicy -PolicyStore {POLICY_STORE} | '
         f'Where-Object {{ $_.Name -like "{POLICY_PREFIX}*" }} '
         f"| Select-Object Name, AppPathNameMatchCondition, IPProtocolMatchCondition, "
-        f"IPDstPortMatchCondition, IPDstPortStartMatchCondition, "
-        f"IPDstPortEndMatchCondition, DSCPAction | ConvertTo-Json -Compress"
+        f"IPDstPrefixMatchCondition, IPDstPortMatchCondition, "
+        f"IPDstPortStartMatchCondition, IPDstPortEndMatchCondition, "
+        f"IPSrcPortMatchCondition, IPSrcPortStartMatchCondition, "
+        f"IPSrcPortEndMatchCondition, DSCPAction | ConvertTo-Json -Compress"
     )
 
     success, output = _run_powershell(list_cmd)
@@ -388,9 +514,13 @@ def get_active_policies():
                 "name": p.get("Name", ""),
                 "app": p.get("AppPathNameMatchCondition", ""),
                 "protocol": p.get("IPProtocolMatchCondition", ""),
+                "dst_prefix": p.get("IPDstPrefixMatchCondition", ""),
                 "dst_port": p.get("IPDstPortMatchCondition", ""),
                 "dst_port_start": p.get("IPDstPortStartMatchCondition", ""),
                 "dst_port_end": p.get("IPDstPortEndMatchCondition", ""),
+                "src_port": p.get("IPSrcPortMatchCondition", ""),
+                "src_port_start": p.get("IPSrcPortStartMatchCondition", ""),
+                "src_port_end": p.get("IPSrcPortEndMatchCondition", ""),
                 "dscp": p.get("DSCPAction", 0),
             }
             for p in data

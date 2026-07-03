@@ -76,11 +76,40 @@ class AgentState:
                 "rules_count": self.rules_count,
                 "configured": cfg.is_configured(self.config),
                 "dscp_value": cfg.normalize_dscp_value(self.config.get("dscp_value")),
+                "local_live_flow_policies": bool(self.config.get("local_live_flow_policies", True)),
             }
 
 
-def _build_policy_specs(detected, connections):
+def _build_policy_specs(detected, connections, local_live_flow_policies=True):
     specs = []
+
+    if local_live_flow_policies:
+        for conn in connections:
+            if not conn.get("selected", True):
+                continue
+            if str(conn.get("proto") or "udp").lower() != "udp":
+                continue
+
+            game_name = conn.get("game")
+            game_data = detected.get(game_name)
+            if not game_data:
+                continue
+
+            remote_ip = conn.get("remote_ip")
+            remote_port = conn.get("remote_port")
+            if not remote_ip or not remote_port:
+                continue
+
+            specs.extend(qos.build_policy_specs(
+                game_name,
+                game_data["exe_name"],
+                None,
+                remote_ip=remote_ip,
+                remote_port=remote_port,
+                local_port=conn.get("local_port"),
+            ))
+
+        return specs
 
     for game_name, game_data in detected.items():
         specs.extend(qos.build_policy_specs(game_name, game_data["exe_name"], None))
@@ -90,7 +119,16 @@ def _build_policy_specs(detected, connections):
 
 def _policy_signature(specs, dscp_value):
     data = [
-        (spec["name"], spec["exe"], spec["start_port"], spec["end_port"], dscp_value)
+        (
+            spec["name"],
+            spec["exe"],
+            spec.get("start_port"),
+            spec.get("end_port"),
+            spec.get("dst_prefix"),
+            spec.get("dst_port"),
+            spec.get("src_port"),
+            dscp_value,
+        )
         for spec in specs
     ]
     return json.dumps(sorted(data), sort_keys=True)
@@ -302,6 +340,7 @@ def monitor_loop(state):
             interval = current_config.get("heartbeat_interval", 30)
             next_sleep = interval
             dscp_value = cfg.normalize_dscp_value(current_config.get("dscp_value"))
+            local_live_flow_policies = bool(current_config.get("local_live_flow_policies", True))
             insecure_tls = bool(current_config.get("insecure_tls", False))
 
             if not cfg.is_configured(current_config):
@@ -344,11 +383,13 @@ def monitor_loop(state):
                 state.flow_candidates = flow_candidates
                 state.flow_status = flow_collector.status()
 
-            desired_specs = _build_policy_specs(detected, connections)
+            desired_specs = _build_policy_specs(detected, connections, local_live_flow_policies)
             desired_signature = _policy_signature(desired_specs, dscp_value)
             if transitioned_to_idle or desired_signature != last_policy_signature:
                 policy_reason = "game stop" if transitioned_to_idle else (
-                    "game update" if desired_specs else "startup cleanup"
+                    ("live-flow update" if local_live_flow_policies else "game update")
+                    if desired_specs else
+                    ("live-flow cleanup" if local_live_flow_policies and detected else "startup cleanup")
                 )
                 if _sync_windows_policies(desired_specs, dscp_value, policy_reason):
                     last_policy_signature = desired_signature
@@ -943,7 +984,7 @@ def show_settings(state, parent):
     def _run():
         root = tk.Toplevel(parent)
         root.title("MultiWAN QoS Agent — Settings")
-        root.geometry("460x350")
+        root.geometry("460x390")
         root.resizable(False, False)
         root.update_idletasks()
         root.tk.call("tk::PlaceWindow", root._w, "center")
@@ -998,6 +1039,16 @@ def show_settings(state, parent):
             command=mark_tls_manual,
         ).pack(anchor="w", pady=(6, 0))
 
+        flow_policy_var = tk.BooleanVar(
+            master=root,
+            value=bool(state.config.get("local_live_flow_policies", True)),
+        )
+        ttk.Checkbutton(
+            frame,
+            text="Mark only selected live flows on this PC",
+            variable=flow_policy_var,
+        ).pack(anchor="w", pady=(8, 0))
+
         # Auto-start
         auto_start_value = is_autostart_enabled()
         with state.lock:
@@ -1046,6 +1097,7 @@ def show_settings(state, parent):
             new_config["router_ip"] = router_ip
             new_config["api_key"] = api_key
             new_config["insecure_tls"] = bool(tls_var.get())
+            new_config["local_live_flow_policies"] = bool(flow_policy_var.get())
             new_config["auto_start"] = auto_start
             new_config["setup_complete"] = True
 

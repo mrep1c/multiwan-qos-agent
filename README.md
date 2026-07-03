@@ -14,7 +14,8 @@ The router endpoint is:
 
 - Detects active game processes from the built-in game database and custom
   user entries.
-- Applies Windows QoS policies for selected DSCP tagging.
+- Applies Windows QoS policies for selected DSCP tagging, with an option to
+  mark only selected live flows on the PC.
 - Uses UDP flow telemetry and psutil connection inspection to identify live
   remote game endpoints.
 - Syncs active game connection metadata to the OpenWrt router.
@@ -83,7 +84,7 @@ https://github.com/mrep1c/multiwan-qos-agent/releases
 Current asset:
 
 ```text
-MultiWAN-QoS-Agent-v1.0.1-windows-x64.exe
+MultiWAN-QoS-Agent-v1.0.2-windows-x64.exe
 ```
 
 Run the EXE as administrator. Windows may show a SmartScreen warning because
@@ -95,8 +96,10 @@ First setup:
 1. Enter the router IP address, for example `192.168.1.1`.
 2. Paste the API key from LuCI.
 3. Choose the DSCP class.
-4. Save settings.
-5. Start a supported game and check the Live Dashboard.
+4. Leave `Mark only selected live flows on this PC` enabled for exact local
+   DSCP policies, or disable it to mark all UDP from detected game executables.
+5. Save settings.
+6. Start a supported game and check the Live Dashboard.
 
 ## Config And Logs
 
@@ -166,6 +169,8 @@ If DSCP policies are not applied:
 
 - Run the app as administrator.
 - Confirm the selected game process is detected.
+- If exact live-flow marking is enabled, confirm the Live Dashboard shows
+  selected UDP flows for the game.
 - Check the app log file.
 - Check Windows policy state with PowerShell.
 
