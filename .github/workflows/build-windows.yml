@@ -1,0 +1,85 @@
+name: Build Windows Agent
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build executable
+        shell: cmd
+        env:
+          CI: "1"
+        run: build.bat
+
+      - name: Name release asset
+        id: asset
+        shell: pwsh
+        run: |
+          $version = python -c "from multiwan_qos_agent import __version__; print(__version__)"
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $expected = $env:GITHUB_REF_NAME -replace '^v', ''
+            if ($expected -ne $version) {
+              throw "Tag $env:GITHUB_REF_NAME does not match package version $version"
+            }
+          }
+
+          $assetName = "MultiWAN-QoS-Agent-v$version-windows-x64.exe"
+          $assetPath = Join-Path "dist" $assetName
+          Move-Item -LiteralPath "dist\MultiWAN QoS Agent.exe" -Destination $assetPath -Force
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "asset_path=$assetPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.asset.outputs.asset_name }}
+          path: ${{ steps.asset.outputs.asset_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assetName = "${{ steps.asset.outputs.asset_name }}"
+          $assetPath = "${{ steps.asset.outputs.asset_path }}"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag $assetPath `
+              --title $tag `
+              --notes "Windows agent build for $tag."
+            exit
+          }
+
+          $existingAssets = gh release view $tag --json assets --jq ".assets[].name"
+          if ($existingAssets -contains $assetName) {
+            Write-Host "Release asset $assetName already exists; leaving it unchanged."
+          } else {
+            gh release upload $tag $assetPath
+          }
