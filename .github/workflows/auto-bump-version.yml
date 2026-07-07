@@ -1,0 +1,72 @@
+name: Auto Bump Version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump Windows agent version when app changes
+        shell: pwsh
+        run: |
+          $before = "${{ github.event.before }}"
+          $head = "${{ github.sha }}"
+          if ($before -match '^0+$') {
+            $before = "HEAD^"
+          }
+
+          $changed = @(git diff --name-only $before $head | Where-Object { $_ })
+          $versionFiles = @(
+            "multiwan_qos_agent/__init__.py"
+          )
+
+          if ($changed | Where-Object { $versionFiles -contains $_ }) {
+            Write-Host "Version file changed in this push; skipping auto bump."
+            exit 0
+          }
+
+          $relevant = @($changed | Where-Object {
+            $_ -like "multiwan_qos_agent/*" -or
+            $_ -eq "build.bat" -or
+            $_ -like "requirements*.txt"
+          })
+
+          if ($relevant.Count -eq 0) {
+            Write-Host "No Windows agent app changes require a version bump."
+            exit 0
+          }
+
+          $file = "multiwan_qos_agent/__init__.py"
+          $text = Get-Content -Raw -LiteralPath $file
+          if ($text -notmatch '__version__\s*=\s*"([0-9]+)\.([0-9]+)\.([0-9]+)"') {
+            throw "Could not parse __version__ from $file"
+          }
+
+          $newVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+          $replacement = '__version__ = "{0}"' -f $newVersion
+          $text = $text -replace '__version__\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"', $replacement
+          Set-Content -LiteralPath $file -Value $text
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add $file
+
+          if (-not (git status --porcelain)) {
+            Write-Host "No version change to commit."
+            exit 0
+          }
+
+          git commit -m "Bump Windows agent version to $newVersion"
+          git push
