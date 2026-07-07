@@ -36,9 +36,10 @@ TASK_NAME = "MultiWAN QoS Agent"
 SINGLE_INSTANCE_MUTEX = "Local\\MultiWANQoSAgentSingleInstance"
 ERROR_ALREADY_EXISTS = 183
 ROUTER_RULE_REASSERT_SECONDS = 60
+ACTIVE_GAME_SYNC_INTERVAL_SECONDS = 10
 ROUTER_FAST_RECOVERY_SECONDS = 60
-ROUTER_FAST_RECOVERY_INTERVAL_SECONDS = 2
-ROUTER_NO_FLOW_GRACE_SECONDS = 120
+ROUTER_FAST_RECOVERY_INTERVAL_SECONDS = ACTIVE_GAME_SYNC_INTERVAL_SECONDS
+ROUTER_NO_FLOW_GRACE_SECONDS = 30
 ROUTER_SHUTDOWN_TIMEOUT_SECONDS = 3
 _single_instance_handle = None
 
@@ -409,6 +410,8 @@ def monitor_loop(state):
                 connections, flow_candidates = [], []
             router_connections = _router_rule_connections(connections)
             conns_json = _router_rule_signature(connections, dscp_value)
+            if detected:
+                next_sleep = min(interval, ACTIVE_GAME_SYNC_INTERVAL_SECONDS)
 
             # Update shared state
             with state.lock:

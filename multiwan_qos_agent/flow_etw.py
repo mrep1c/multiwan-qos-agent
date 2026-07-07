@@ -788,14 +788,26 @@ class EtwFlowCollector:
 
         with self.lock:
             for candidate_pid in candidate_pids:
-                key = (candidate_pid, remote_ip, int(remote_port))
+                local_port_id = int(local_port or 0)
+                key = (candidate_pid, remote_ip, int(remote_port), local_port_id)
+                if local_port_id:
+                    stale_keys = [
+                        old_key for old_key in self.flows
+                        if len(old_key) == 4
+                        and old_key[0] == candidate_pid
+                        and old_key[1] == remote_ip
+                        and old_key[2] == int(remote_port)
+                        and old_key[3] != local_port_id
+                    ]
+                    for old_key in stale_keys:
+                        del self.flows[old_key]
                 flow = self.flows.get(key)
                 if not flow:
                     flow = {
                         "pid": candidate_pid,
                         "remote_ip": remote_ip,
                         "remote_port": int(remote_port),
-                        "local_port": int(local_port or 0),
+                        "local_port": local_port_id,
                         "bytes": 0,
                         "packets": 0,
                         "first_seen": now,
