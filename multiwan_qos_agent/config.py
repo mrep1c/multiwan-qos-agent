@@ -40,10 +40,12 @@ LOCAL_TAGGING_MODE_MIGRATION_VERSION = 1
 LOCAL_TAGGING_RULE_GLOBAL = "global"
 LOCAL_TAGGING_RULE_ENABLED = "enabled"
 LOCAL_TAGGING_RULE_DISABLED = "disabled"
+LOCAL_TAGGING_RULE_PROGRAM_DISABLED = "program_disabled"
 LOCAL_TAGGING_RULES = {
     LOCAL_TAGGING_RULE_GLOBAL,
     LOCAL_TAGGING_RULE_ENABLED,
     LOCAL_TAGGING_RULE_DISABLED,
+    LOCAL_TAGGING_RULE_PROGRAM_DISABLED,
 }
 
 DEFAULT_CONFIG = {
@@ -134,6 +136,8 @@ def local_tagging_rule_label(value):
         return "Enable local tagging"
     if value == LOCAL_TAGGING_RULE_DISABLED:
         return "Disable local tagging"
+    if value == LOCAL_TAGGING_RULE_PROGRAM_DISABLED:
+        return "Disable program (local + router)"
     return "Use global setting"
 
 
@@ -142,6 +146,7 @@ def local_tagging_rule_from_label(label):
         LOCAL_TAGGING_RULE_GLOBAL,
         LOCAL_TAGGING_RULE_ENABLED,
         LOCAL_TAGGING_RULE_DISABLED,
+        LOCAL_TAGGING_RULE_PROGRAM_DISABLED,
     ):
         if label == local_tagging_rule_label(value):
             return value
@@ -153,6 +158,7 @@ def local_tagging_rule_options():
         local_tagging_rule_label(LOCAL_TAGGING_RULE_GLOBAL),
         local_tagging_rule_label(LOCAL_TAGGING_RULE_ENABLED),
         local_tagging_rule_label(LOCAL_TAGGING_RULE_DISABLED),
+        local_tagging_rule_label(LOCAL_TAGGING_RULE_PROGRAM_DISABLED),
     ]
 
 

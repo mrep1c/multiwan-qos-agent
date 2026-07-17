@@ -143,14 +143,16 @@ overrides. Custom entries should include:
 - expected protocol.
 
 Each game can use the global local-tagging setting, explicitly enable local
-tagging, or disable local tagging. Disabling local tagging for a game does not
-stop detection or router rule sync. If global local tagging is disabled in
-Settings, no per-game rule creates local Windows QoS policies.
+tagging, or disable local tagging. `Disable local tagging` only removes the
+Windows policy; detection and router rule sync continue. Use `Disable program
+(local + router)` to suppress both the Windows policy and that program's live
+router rule synchronization while keeping detection visible. If global local
+tagging is disabled in Settings, no per-game rule creates local Windows QoS
+policies.
 
-Use `Delete Rule` in the Game Rules editor to remove a per-game override and
-return that game to `Use global setting`. `Delete Game` removes a custom game
-definition; built-in games remain available and can only have their override
-deleted.
+Select `Use global setting` and save to remove a per-game override. `Delete
+Game` removes a custom game definition and its override; built-in games remain
+available.
 
 After changing custom games or game rules, restart detection from the tray app
 or restart the agent.

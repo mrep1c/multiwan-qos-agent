@@ -95,7 +95,16 @@ def _game_allows_local_tagging(game_data, game_rules, local_tagging_enabled):
     if not local_tagging_enabled:
         return False
     rule = _local_tagging_rule(game_data, game_rules)
-    return rule != cfg.LOCAL_TAGGING_RULE_DISABLED
+    return rule not in (
+        cfg.LOCAL_TAGGING_RULE_DISABLED,
+        cfg.LOCAL_TAGGING_RULE_PROGRAM_DISABLED,
+    )
+
+
+def _game_program_disabled(game_data, game_rules):
+    if not game_data:
+        return False
+    return _local_tagging_rule(game_data, game_rules) == cfg.LOCAL_TAGGING_RULE_PROGRAM_DISABLED
 
 
 def _build_policy_specs(
@@ -167,10 +176,13 @@ def _policy_signature(specs, dscp_value):
     return json.dumps(sorted(data), sort_keys=True)
 
 
-def _router_rule_connections(connections):
+def _router_rule_connections(connections, detected, game_rules):
     """Return only fields that affect router nft rules."""
     rule_connections = []
     for conn in connections:
+        game_data = detected.get(conn.get("game"))
+        if _game_program_disabled(game_data, game_rules):
+            continue
         if conn.get("remote_ip") and conn.get("remote_port"):
             item = {
                 "game": conn.get("game"),
@@ -184,9 +196,9 @@ def _router_rule_connections(connections):
     return rule_connections
 
 
-def _router_rule_signature(connections, dscp_value):
+def _router_rule_signature(connections, dscp_value, detected, game_rules):
     return json.dumps({
-        "connections": _router_rule_connections(connections),
+        "connections": _router_rule_connections(connections, detected, game_rules),
         "dscp": dscp_value,
     }, sort_keys=True)
 
@@ -348,6 +360,7 @@ def monitor_loop(state):
     """Background thread: detect games → QoS policies → sync router."""
     prev_games = set()
     last_conns_json = None
+    last_router_game_names = set()
     last_router_update_time = 0
     last_policy_signature = None
     router_clear_pending = False
@@ -408,8 +421,15 @@ def monitor_loop(state):
                 )
             else:
                 connections, flow_candidates = [], []
-            router_connections = _router_rule_connections(connections)
-            conns_json = _router_rule_signature(connections, dscp_value)
+            router_connections = _router_rule_connections(connections, detected, game_rules)
+            conns_json = _router_rule_signature(connections, dscp_value, detected, game_rules)
+            disabled_game_names = {
+                game_name
+                for game_name, game_data in detected.items()
+                if _game_program_disabled(game_data, game_rules)
+            }
+            program_disabled_only = bool(detected) and len(disabled_game_names) == len(detected)
+            stale_disabled_rules = bool(disabled_game_names & last_router_game_names)
             if detected:
                 next_sleep = min(interval, ACTIVE_GAME_SYNC_INTERVAL_SECONDS)
 
@@ -449,7 +469,11 @@ def monitor_loop(state):
                         no_flow_started_at = now
                     no_flow_age = now - no_flow_started_at
                     should_clear_no_flow = (
-                        no_flow_age >= ROUTER_NO_FLOW_GRACE_SECONDS and
+                        (
+                            program_disabled_only or
+                            stale_disabled_rules or
+                            no_flow_age >= ROUTER_NO_FLOW_GRACE_SECONDS
+                        ) and
                         not no_flow_clear_sent
                     )
 
@@ -459,13 +483,14 @@ def monitor_loop(state):
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
                         logger.info(
-                            "Router agent clear after %.0fs without selected live UDP: %s - %s",
+                            "Router agent clear after %.0fs without router-eligible live flow: %s - %s",
                             no_flow_age,
                             "OK" if ok else "failed",
                             msg,
                         )
                         if ok:
                             last_conns_json = None
+                            last_router_game_names.clear()
                             last_router_update_time = 0
                             router_clear_pending = False
                             no_flow_clear_sent = True
@@ -514,12 +539,18 @@ def monitor_loop(state):
                                     "Router update returned zero active rules while live flows exist. Scheduling re-sync."
                                 )
                                 last_conns_json = None
+                                last_router_game_names.clear()
                                 last_router_update_time = 0
                                 router_clear_pending = False
                                 fast_recovery_until = time.monotonic() + ROUTER_FAST_RECOVERY_SECONDS
                                 next_sleep = ROUTER_FAST_RECOVERY_INTERVAL_SECONDS
                             else:
                                 last_conns_json = conns_json
+                                last_router_game_names = {
+                                    conn.get("game")
+                                    for conn in router_connections
+                                    if conn.get("game")
+                                }
                                 last_router_update_time = now
                                 router_clear_pending = False
                                 fast_recovery_until = 0
@@ -543,6 +574,7 @@ def monitor_loop(state):
                                 "Router heartbeat reports zero active rules while live flows exist. Scheduling update."
                             )
                             last_conns_json = None
+                            last_router_game_names.clear()
                             last_router_update_time = 0
                             router_clear_pending = False
                             fast_recovery_until = time.monotonic() + ROUTER_FAST_RECOVERY_SECONDS
@@ -587,6 +619,7 @@ def monitor_loop(state):
                     )
                     if ok:
                         router_clear_pending = False
+                        last_router_game_names.clear()
                         last_router_update_time = 0
                 else:
                     ok, msg = sync.send_heartbeat(
@@ -777,9 +810,6 @@ def show_custom_games(state, parent):
             rule = rule_for(entry["id"])
             rule_var.set(cfg.local_tagging_rule_label(rule))
             set_custom_editable(entry["source"] == "custom")
-            clear_rule_button.configure(
-                state="normal" if rule != cfg.LOCAL_TAGGING_RULE_GLOBAL else "disabled"
-            )
             status_var.set("")
 
         def validate_form(existing_id=None):
@@ -818,23 +848,6 @@ def show_custom_games(state, parent):
                 rules[game_key] = {"local_tagging": rule}
             set_rules(rules)
 
-        def delete_rule():
-            current = entries_state.get("selected")
-            if not current or not current.get("id"):
-                status_var.set("Select a game rule to delete")
-                return
-
-            rules = get_rules()
-            if current["id"] not in rules:
-                status_var.set("No saved rule override")
-                clear_rule_button.configure(state="disabled")
-                return
-
-            rules.pop(current["id"], None)
-            set_rules(rules)
-            refresh_list(current["id"])
-            status_var.set("Rule deleted; using global setting")
-
         def save_entry():
             current = entries_state.get("selected")
 
@@ -869,7 +882,6 @@ def show_custom_games(state, parent):
             exe_var.set("")
             rule_var.set(cfg.local_tagging_rule_label(cfg.LOCAL_TAGGING_RULE_GLOBAL))
             set_custom_editable(True)
-            clear_rule_button.configure(state="disabled")
             status_var.set("")
 
         def delete_entry():
@@ -892,9 +904,6 @@ def show_custom_games(state, parent):
         buttons.pack(fill="x", pady=(12, 0))
         ttk.Button(buttons, text="New Custom", command=new_entry).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Save", command=save_entry).pack(side="left", padx=(0, 6))
-        clear_rule_button = ttk.Button(buttons, text="Delete Rule", command=delete_rule)
-        clear_rule_button.pack(side="left", padx=(0, 6))
-        clear_rule_button.configure(state="disabled")
         delete_button = ttk.Button(buttons, text="Delete Game", command=delete_entry)
         delete_button.pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Close", command=root.destroy).pack(side="right")
