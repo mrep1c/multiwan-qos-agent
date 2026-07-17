@@ -147,6 +147,11 @@ tagging, or disable local tagging. Disabling local tagging for a game does not
 stop detection or router rule sync. If global local tagging is disabled in
 Settings, no per-game rule creates local Windows QoS policies.
 
+Use `Delete Rule` in the Game Rules editor to remove a per-game override and
+return that game to `Use global setting`. `Delete Game` removes a custom game
+definition; built-in games remain available and can only have their override
+deleted.
+
 After changing custom games or game rules, restart detection from the tray app
 or restart the agent.
 

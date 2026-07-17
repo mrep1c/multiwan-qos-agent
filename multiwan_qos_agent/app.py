@@ -774,8 +774,12 @@ def show_custom_games(state, parent):
             source_var.set("Built-in game" if entry["source"] == "builtin" else "Custom game")
             name_var.set(game.get("name", ""))
             exe_var.set(", ".join(game.get("executables", [])))
-            rule_var.set(cfg.local_tagging_rule_label(rule_for(entry["id"])))
+            rule = rule_for(entry["id"])
+            rule_var.set(cfg.local_tagging_rule_label(rule))
             set_custom_editable(entry["source"] == "custom")
+            clear_rule_button.configure(
+                state="normal" if rule != cfg.LOCAL_TAGGING_RULE_GLOBAL else "disabled"
+            )
             status_var.set("")
 
         def validate_form(existing_id=None):
@@ -814,6 +818,23 @@ def show_custom_games(state, parent):
                 rules[game_key] = {"local_tagging": rule}
             set_rules(rules)
 
+        def delete_rule():
+            current = entries_state.get("selected")
+            if not current or not current.get("id"):
+                status_var.set("Select a game rule to delete")
+                return
+
+            rules = get_rules()
+            if current["id"] not in rules:
+                status_var.set("No saved rule override")
+                clear_rule_button.configure(state="disabled")
+                return
+
+            rules.pop(current["id"], None)
+            set_rules(rules)
+            refresh_list(current["id"])
+            status_var.set("Rule deleted; using global setting")
+
         def save_entry():
             current = entries_state.get("selected")
 
@@ -848,6 +869,7 @@ def show_custom_games(state, parent):
             exe_var.set("")
             rule_var.set(cfg.local_tagging_rule_label(cfg.LOCAL_TAGGING_RULE_GLOBAL))
             set_custom_editable(True)
+            clear_rule_button.configure(state="disabled")
             status_var.set("")
 
         def delete_entry():
@@ -870,7 +892,10 @@ def show_custom_games(state, parent):
         buttons.pack(fill="x", pady=(12, 0))
         ttk.Button(buttons, text="New Custom", command=new_entry).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Save", command=save_entry).pack(side="left", padx=(0, 6))
-        delete_button = ttk.Button(buttons, text="Delete", command=delete_entry)
+        clear_rule_button = ttk.Button(buttons, text="Delete Rule", command=delete_rule)
+        clear_rule_button.pack(side="left", padx=(0, 6))
+        clear_rule_button.configure(state="disabled")
+        delete_button = ttk.Button(buttons, text="Delete Game", command=delete_entry)
         delete_button.pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Close", command=root.destroy).pack(side="right")
 
