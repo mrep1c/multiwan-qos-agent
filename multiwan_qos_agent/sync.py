@@ -25,6 +25,7 @@ class SyncResult:
     detail: str = ""
     endpoint: str = ""
     status_code: int = None
+    conntrack_unmatched: int = 0
 
     def __iter__(self):
         yield self.ok
@@ -112,6 +113,12 @@ def _response_rule_count(response, message):
     if match:
         return int(match.group(1))
     return None
+
+
+def _response_conntrack_unmatched(response):
+    """Return the number of submitted flows not resolved by router conntrack."""
+    data = _response_json(response)
+    return _to_int(data.get("conntrack_unmatched")) or 0
 
 
 def _structured_update_validation(response, message):
@@ -206,10 +213,10 @@ def _do_request(router_ip, payload, timeout=REQUEST_TIMEOUT, insecure_tls=False)
     return None, last_error
 
 
-def _sync_result(ok, message, response=None, rule_count=None, detail=""):
+def _sync_result(ok, message, response=None, rule_count=None, detail="", conntrack_unmatched=0):
     endpoint = getattr(response, "multiwan_qos_url", "") if response is not None else ""
     status_code = _effective_status_code(response) if response is not None else None
-    return SyncResult(ok, message, rule_count, detail, endpoint, status_code)
+    return SyncResult(ok, message, rule_count, detail, endpoint, status_code, conntrack_unmatched)
 
 
 def send_update(router_ip, api_key, pc_ip, connections, dscp_value=46, insecure_tls=False):
@@ -232,16 +239,20 @@ def send_update(router_ip, api_key, pc_ip, connections, dscp_value=46, insecure_
     if status_code == 200:
         msg = _response_message(response, "OK")
         rule_count = _response_rule_count(response, msg)
+        conntrack_unmatched = _response_conntrack_unmatched(response)
         endpoint = getattr(response, "multiwan_qos_url", "unknown endpoint")
         verified, detail = _structured_update_validation(response, msg)
         if not verified:
             logger.warning("Router sync failed verification via %s: %s (%s)", endpoint, msg, detail)
-            return _sync_result(False, detail, response, rule_count, detail)
+            return _sync_result(False, detail, response, rule_count, detail, conntrack_unmatched)
         if rule_count is None:
             logger.warning("Router sync OK via %s but rule count was not reported: %s", endpoint, msg)
         else:
-            logger.info("Router sync OK via %s: %s (rules=%d, %s)", endpoint, msg, rule_count, detail)
-        return _sync_result(True, msg, response, rule_count, detail)
+            logger.info(
+                "Router sync OK via %s: %s (rules=%d, %s, conntrack_unmatched=%d)",
+                endpoint, msg, rule_count, detail, conntrack_unmatched,
+            )
+        return _sync_result(True, msg, response, rule_count, detail, conntrack_unmatched)
     else:
         msg = _response_message(response)
         logger.warning("Router sync failed: %s", msg)

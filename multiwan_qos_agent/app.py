@@ -534,10 +534,18 @@ def monitor_loop(state):
                         ok, msg = sync_result
                         if ok:
                             synced_rule_count = sync_result.rule_count
-                            if router_connections and synced_rule_count == 0:
-                                logger.warning(
-                                    "Router update returned zero active rules while live flows exist. Scheduling re-sync."
-                                )
+                            unmatched = int(getattr(sync_result, "conntrack_unmatched", 0) or 0)
+                            if router_connections and (synced_rule_count == 0 or unmatched > 0):
+                                if unmatched > 0:
+                                    logger.warning(
+                                        "Router update left %d live flow(s) unresolved (rules=%s); scheduling active-flow retry.",
+                                        unmatched,
+                                        synced_rule_count if synced_rule_count is not None else "unknown",
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Router update returned zero active rules while live flows exist; scheduling active-flow retry."
+                                    )
                                 last_conns_json = None
                                 last_router_game_names.clear()
                                 last_router_update_time = 0
