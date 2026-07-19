@@ -20,6 +20,8 @@ The router endpoint is:
 - Uses UDP flow telemetry and psutil connection inspection to identify live
   remote game endpoints.
 - Syncs active game connection metadata to the OpenWrt router.
+- Signals verified new live-flow sessions so router Adaptive mode can restore
+  its session-start baseline without waiting for an aggregate idle timeout.
 - Clears router-side agent rules when games stop or the app exits.
 - Provides a tray app, live dashboard, settings dialog, and custom game editor.
 - Supports Start with Windows through Task Scheduler.

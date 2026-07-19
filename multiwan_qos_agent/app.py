@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import uuid
 from tkinter import ttk, messagebox
 
 import pystray
@@ -203,6 +204,20 @@ def _router_rule_signature(connections, dscp_value, detected, game_rules):
     }, sort_keys=True)
 
 
+def _router_flow_session_identities(connections):
+    """Return stable live-flow identities, independent of DSCP and ordering."""
+    flow_ids = set()
+    for conn in connections:
+        flow_ids.add((
+            str(conn.get("game") or ""),
+            str(conn.get("proto") or "").lower(),
+            str(conn.get("remote_ip") or ""),
+            int(conn.get("remote_port") or 0),
+            int(conn.get("local_port") or 0),
+        ))
+    return flow_ids
+
+
 def _message_needs_router_clear(message):
     message = str(message or "").lower()
     return any(token in message for token in (
@@ -236,6 +251,7 @@ def _message_triggers_fast_recovery(message):
         "chain missing",
         "missing_chain",
         "agent nft chain not found",
+        "session transition",
     ))
 
 
@@ -367,6 +383,8 @@ def monitor_loop(state):
     fast_recovery_until = 0
     no_flow_started_at = None
     no_flow_clear_sent = False
+    seen_session_flows = set()
+    router_session_id = None
     exe_map = monitor.get_all_game_executables(state.game_db, state.user_games)
     interval = state.config.get("heartbeat_interval", 30)
     flow_collector = flow_etw.EtwFlowCollector()
@@ -423,6 +441,20 @@ def monitor_loop(state):
                 connections, flow_candidates = [], []
             router_connections = _router_rule_connections(connections, detected, game_rules)
             conns_json = _router_rule_signature(connections, dscp_value, detected, game_rules)
+            if router_connections:
+                session_flows = _router_flow_session_identities(router_connections)
+                new_session_flows = session_flows - seen_session_flows
+                if new_session_flows:
+                    router_session_id = uuid.uuid4().hex
+                    logger.info(
+                        "New router flow session detected (%d new flow%s)",
+                        len(new_session_flows),
+                        "" if len(new_session_flows) == 1 else "s",
+                    )
+                seen_session_flows.update(session_flows)
+            elif not detected:
+                seen_session_flows.clear()
+                router_session_id = None
             disabled_game_names = {
                 game_name
                 for game_name, game_data in detected.items()
@@ -494,6 +526,8 @@ def monitor_loop(state):
                             last_router_update_time = 0
                             router_clear_pending = False
                             no_flow_clear_sent = True
+                            seen_session_flows.clear()
+                            router_session_id = None
                     else:
                         preserve_router_rules = last_conns_json is not None
                         sync_result = sync.send_heartbeat(
@@ -530,7 +564,8 @@ def monitor_loop(state):
                         sync_result = sync.send_update(
                             current_config["router_ip"], current_config["api_key"],
                             pc_ip, router_connections, dscp_value,
-                            insecure_tls=insecure_tls)
+                            insecure_tls=insecure_tls,
+                            session_id=router_session_id)
                         ok, msg = sync_result
                         if ok:
                             synced_rule_count = sync_result.rule_count

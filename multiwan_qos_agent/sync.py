@@ -219,7 +219,8 @@ def _sync_result(ok, message, response=None, rule_count=None, detail="", conntra
     return SyncResult(ok, message, rule_count, detail, endpoint, status_code, conntrack_unmatched)
 
 
-def send_update(router_ip, api_key, pc_ip, connections, dscp_value=46, insecure_tls=False):
+def send_update(router_ip, api_key, pc_ip, connections, dscp_value=46,
+                insecure_tls=False, session_id=None):
     payload = {
         "api_key": api_key,
         "action": "update",
@@ -227,6 +228,11 @@ def send_update(router_ip, api_key, pc_ip, connections, dscp_value=46, insecure_
         "connections": connections,
         "dscp": int(dscp_value),
     }
+    if session_id:
+        session_id = str(session_id).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", session_id):
+            return _sync_result(False, "Invalid flow session identifier")
+        payload["session_id"] = session_id
     
     # Don't log connections list to avoid leaking info in debug
     response, err = _do_request(router_ip, payload, insecure_tls=insecure_tls)
