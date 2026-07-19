@@ -179,6 +179,7 @@ def _etw_connection_entry(game_name, flow):
         "local_port": flow.get("local_port"),
         "source": flow.get("source", "ETW flow telemetry"),
         "throughput_bps": int(flow.get("bytes_per_sec", 0)),
+        "last_packet_age": max(0.0, float(flow.get("idle", 0.0))),
         "selected": True,
     }
 
@@ -189,8 +190,10 @@ def _ignored_flow_entry(game_name, flow):
         "proto": "udp",
         "remote_ip": flow.get("remote_ip", ""),
         "remote_port": flow.get("remote_port", ""),
+        "local_port": flow.get("local_port"),
         "source": "ETW flow ignored",
         "throughput_bps": int(flow.get("bytes_per_sec", 0)),
+        "last_packet_age": max(0.0, float(flow.get("idle", 0.0))),
         "selected": False,
         "ignored_reason": flow.get("ignored_reason", "ignored"),
     }
@@ -224,6 +227,25 @@ def build_connection_report(detected_games, flow_collector=None):
             continue
 
         live_conns = get_process_connections(pids)
+
+        if etw_ignored:
+            stale_flow_keys = {
+                (
+                    str(flow.get("remote_ip") or ""),
+                    int(flow.get("remote_port") or 0),
+                    int(flow.get("local_port") or 0),
+                )
+                for flow in etw_ignored
+                if flow.get("ignored_reason") == "stale"
+            }
+            live_conns = [
+                conn for conn in live_conns
+                if (
+                    str(conn.get("remote_ip") or ""),
+                    int(conn.get("remote_port") or 0),
+                    int(conn.get("local_port") or 0),
+                ) not in stale_flow_keys
+            ]
 
         if live_conns:
             logger.info(

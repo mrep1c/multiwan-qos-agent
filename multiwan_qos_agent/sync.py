@@ -14,7 +14,7 @@ from dataclasses import dataclass
 logger = logging.getLogger("multiwan_qos_agent.sync")
 
 # Timeout for HTTP requests to the router
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 4  # seconds; router is on the local network
 
 
 @dataclass

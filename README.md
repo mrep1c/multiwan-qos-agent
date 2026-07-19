@@ -22,6 +22,8 @@ The router endpoint is:
 - Syncs active game connection metadata to the OpenWrt router.
 - Signals verified new live-flow sessions so router Adaptive mode can restore
   its session-start baseline without waiting for an aggregate idle timeout.
+- Scans for games every 2 seconds while idle, wakes on new ETW game flows, and
+  uses 5-second active synchronization with a slower idle heartbeat.
 - Clears router-side agent rules when games stop or the app exits.
 - Provides a tray app, live dashboard, settings dialog, and custom game editor.
 - Supports Start with Windows through Task Scheduler.

@@ -37,10 +37,13 @@ TASK_NAME = "MultiWAN QoS Agent"
 SINGLE_INSTANCE_MUTEX = "Local\\MultiWANQoSAgentSingleInstance"
 ERROR_ALREADY_EXISTS = 183
 ROUTER_RULE_REASSERT_SECONDS = 60
-ACTIVE_GAME_SYNC_INTERVAL_SECONDS = 10
+IDLE_DETECTION_INTERVAL_SECONDS = 2
+ACTIVE_GAME_STEADY_INTERVAL_SECONDS = 5
+ACTIVE_GAME_HEARTBEAT_INTERVAL_SECONDS = 5
 ROUTER_FAST_RECOVERY_SECONDS = 60
-ROUTER_FAST_RECOVERY_INTERVAL_SECONDS = ACTIVE_GAME_SYNC_INTERVAL_SECONDS
-ROUTER_NO_FLOW_GRACE_SECONDS = 30
+ROUTER_FAST_RECOVERY_INTERVAL_SECONDS = 2
+ROUTER_HEARTBEAT_RETRY_SECONDS = 5
+ROUTER_NO_FLOW_TIMEOUT_SECONDS = 30
 ROUTER_SHUTDOWN_TIMEOUT_SECONDS = 3
 _single_instance_handle = None
 
@@ -218,6 +221,33 @@ def _router_flow_session_identities(connections):
     return flow_ids
 
 
+def _latest_router_packet_time(now, connections, detected, game_rules):
+    """Return the newest known packet time among router-eligible live flows."""
+    latest = None
+    for conn in connections:
+        game_data = detected.get(conn.get("game"))
+        if _game_program_disabled(game_data, game_rules):
+            continue
+        if not conn.get("remote_ip") or not conn.get("remote_port"):
+            continue
+        try:
+            packet_age = max(0.0, float(conn.get("last_packet_age", 0.0)))
+        except (TypeError, ValueError):
+            packet_age = 0.0
+        packet_time = now - packet_age
+        latest = packet_time if latest is None else max(latest, packet_time)
+    return latest
+
+
+def _next_heartbeat_deadline(interval, success):
+    try:
+        interval = max(1, int(interval))
+    except (TypeError, ValueError):
+        interval = 30
+    delay = interval if success else min(interval, ROUTER_HEARTBEAT_RETRY_SECONDS)
+    return time.monotonic() + delay
+
+
 def _message_needs_router_clear(message):
     message = str(message or "").lower()
     return any(token in message for token in (
@@ -381,10 +411,11 @@ def monitor_loop(state):
     last_policy_signature = None
     router_clear_pending = False
     fast_recovery_until = 0
-    no_flow_started_at = None
+    last_router_flow_packet_time = None
     no_flow_clear_sent = False
     seen_session_flows = set()
     router_session_id = None
+    next_heartbeat_at = 0.0
     exe_map = monitor.get_all_game_executables(state.game_db, state.user_games)
     interval = state.config.get("heartbeat_interval", 30)
     flow_collector = flow_etw.EtwFlowCollector()
@@ -392,18 +423,26 @@ def monitor_loop(state):
     with state.lock:
         state.flow_status = flow_collector.status()
 
-    logger.info("Monitor started — tracking %d executables, interval %ds", len(exe_map), interval)
+    logger.info(
+        "Monitor started — tracking %d executables, detector=%ds, heartbeat=%ds",
+        len(exe_map),
+        IDLE_DETECTION_INTERVAL_SECONDS,
+        interval,
+    )
 
     while state.running:
-        next_sleep = interval
+        flow_collector.consume_activity()
+        next_sleep = IDLE_DETECTION_INTERVAL_SECONDS
         try:
             with state.lock:
                 current_config = dict(state.config)
                 user_games = list(state.user_games)
                 game_rules = dict(state.game_rules)
 
-            interval = current_config.get("heartbeat_interval", 30)
-            next_sleep = interval
+            try:
+                interval = max(1, int(current_config.get("heartbeat_interval", 30)))
+            except (TypeError, ValueError):
+                interval = 30
             dscp_value = cfg.normalize_dscp_value(current_config.get("dscp_value"))
             local_tagging_enabled = bool(current_config.get("local_tagging_enabled", True))
             local_tagging_mode = cfg.normalize_local_tagging_mode(current_config.get("local_tagging_mode"))
@@ -432,6 +471,11 @@ def monitor_loop(state):
             prev_games = current_names
 
             # Build connections
+            flow_collector.set_tracked_pids(
+                pid
+                for game_data in detected.values()
+                for pid in game_data.get("pids", [])
+            )
             if detected:
                 connections, flow_candidates = monitor.build_connection_report(
                     detected,
@@ -463,7 +507,11 @@ def monitor_loop(state):
             program_disabled_only = bool(detected) and len(disabled_game_names) == len(detected)
             stale_disabled_rules = bool(disabled_game_names & last_router_game_names)
             if detected:
-                next_sleep = min(interval, ACTIVE_GAME_SYNC_INTERVAL_SECONDS)
+                next_sleep = (
+                    ROUTER_FAST_RECOVERY_INTERVAL_SECONDS
+                    if last_conns_json is None
+                    else ACTIVE_GAME_STEADY_INTERVAL_SECONDS
+                )
 
             # Update shared state
             with state.lock:
@@ -493,18 +541,30 @@ def monitor_loop(state):
             pc_ip = monitor.get_local_ip(current_config.get("router_ip"))
             if pc_ip and detected:
                 now = time.monotonic()
+                heartbeat_interval = min(interval, ACTIVE_GAME_HEARTBEAT_INTERVAL_SECONDS)
+                heartbeat_due = now >= next_heartbeat_at
+                router_contacted = False
                 preserve_router_rules = False
                 sync_result = None
+                latest_packet_time = _latest_router_packet_time(
+                    now, connections, detected, game_rules)
+                if latest_packet_time is not None:
+                    if last_router_flow_packet_time is None:
+                        last_router_flow_packet_time = latest_packet_time
+                    else:
+                        last_router_flow_packet_time = max(
+                            last_router_flow_packet_time, latest_packet_time)
                 if not router_connections:
                     fast_recovery_until = 0
-                    if no_flow_started_at is None:
-                        no_flow_started_at = now
-                    no_flow_age = now - no_flow_started_at
+                    next_sleep = ROUTER_FAST_RECOVERY_INTERVAL_SECONDS
+                    if last_router_flow_packet_time is None:
+                        last_router_flow_packet_time = now
+                    no_flow_age = now - last_router_flow_packet_time
                     should_clear_no_flow = (
                         (
                             program_disabled_only or
                             stale_disabled_rules or
-                            no_flow_age >= ROUTER_NO_FLOW_GRACE_SECONDS
+                            no_flow_age >= ROUTER_NO_FLOW_TIMEOUT_SECONDS
                         ) and
                         not no_flow_clear_sent
                     )
@@ -514,6 +574,8 @@ def monitor_loop(state):
                             current_config["router_ip"], current_config["api_key"], pc_ip,
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
+                        router_contacted = True
+                        next_heartbeat_at = _next_heartbeat_deadline(heartbeat_interval, ok)
                         logger.info(
                             "Router agent clear after %.0fs without router-eligible live flow: %s - %s",
                             no_flow_age,
@@ -528,23 +590,25 @@ def monitor_loop(state):
                             no_flow_clear_sent = True
                             seen_session_flows.clear()
                             router_session_id = None
-                    else:
+                            last_router_flow_packet_time = None
+                    elif heartbeat_due:
                         preserve_router_rules = last_conns_json is not None
                         sync_result = sync.send_heartbeat(
                             current_config["router_ip"], current_config["api_key"], pc_ip,
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
+                        router_contacted = True
+                        next_heartbeat_at = _next_heartbeat_deadline(heartbeat_interval, ok)
                         if ok:
                             if preserve_router_rules:
                                 msg = (
                                     "Connected; waiting for live UDP "
                                     f"(preserving game rules, {int(no_flow_age)}s/"
-                                    f"{ROUTER_NO_FLOW_GRACE_SECONDS}s)"
+                                    f"{ROUTER_NO_FLOW_TIMEOUT_SECONDS}s)"
                                 )
                             else:
                                 msg = "Connected; waiting for live UDP"
                 else:
-                    no_flow_started_at = None
                     no_flow_clear_sent = False
                     if fast_recovery_until and now >= fast_recovery_until:
                         logger.warning("Router fast recovery window expired; returning to normal sync cadence.")
@@ -567,6 +631,8 @@ def monitor_loop(state):
                             insecure_tls=insecure_tls,
                             session_id=router_session_id)
                         ok, msg = sync_result
+                        router_contacted = True
+                        next_heartbeat_at = _next_heartbeat_deadline(heartbeat_interval, ok)
                         if ok:
                             synced_rule_count = sync_result.rule_count
                             unmatched = int(getattr(sync_result, "conntrack_unmatched", 0) or 0)
@@ -606,11 +672,13 @@ def monitor_loop(state):
                             next_sleep = ROUTER_FAST_RECOVERY_INTERVAL_SECONDS
                         elif _message_needs_router_clear(msg):
                             router_clear_pending = True
-                    else:
+                    elif heartbeat_due:
                         sync_result = sync.send_heartbeat(
                             current_config["router_ip"], current_config["api_key"], pc_ip,
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
+                        router_contacted = True
+                        next_heartbeat_at = _next_heartbeat_deadline(heartbeat_interval, ok)
                         heartbeat_rule_count = sync_result.rule_count if ok else None
                         if ok and heartbeat_rule_count == 0:
                             logger.warning(
@@ -633,20 +701,22 @@ def monitor_loop(state):
                             logger.warning("Heartbeat failed (chain missing). Scheduling re-sync.")
                             last_conns_json = None
 
-                with state.lock:
-                    state.last_sync_time = time.strftime("%H:%M:%S")
-                    state.last_sync_ok = ok
-                    state.last_sync_msg = msg
-                    parsed_rule_count = sync_result.rule_count if ok and sync_result else None
-                    if parsed_rule_count is not None:
-                        state.rules_count = parsed_rule_count
-                    elif not router_connections and ok and not preserve_router_rules:
-                        state.rules_count = 0
+                if router_contacted:
+                    with state.lock:
+                        state.last_sync_time = time.strftime("%H:%M:%S")
+                        state.last_sync_ok = ok
+                        state.last_sync_msg = msg
+                        parsed_rule_count = sync_result.rule_count if ok and sync_result else None
+                        if parsed_rule_count is not None:
+                            state.rules_count = parsed_rule_count
+                        elif not router_connections and ok and not preserve_router_rules:
+                            state.rules_count = 0
 
             elif pc_ip and not detected:
                 fast_recovery_until = 0
-                no_flow_started_at = None
+                last_router_flow_packet_time = None
                 no_flow_clear_sent = False
+                router_contacted = False
                 if transitioned_to_idle or last_conns_json is not None:
                     router_clear_pending = True
                     last_conns_json = None
@@ -655,6 +725,8 @@ def monitor_loop(state):
                     ok, msg = sync.send_clear(
                         current_config["router_ip"], current_config["api_key"], pc_ip,
                         insecure_tls=insecure_tls)
+                    router_contacted = True
+                    next_heartbeat_at = _next_heartbeat_deadline(interval, ok)
                     logger.info(
                         "Router agent clear after game stop: %s - %s",
                         "OK" if ok else "failed",
@@ -664,17 +736,20 @@ def monitor_loop(state):
                         router_clear_pending = False
                         last_router_game_names.clear()
                         last_router_update_time = 0
-                else:
+                elif time.monotonic() >= next_heartbeat_at:
                     ok, msg = sync.send_heartbeat(
                         current_config["router_ip"], current_config["api_key"], pc_ip,
                         insecure_tls=insecure_tls)
+                    router_contacted = True
+                    next_heartbeat_at = _next_heartbeat_deadline(interval, ok)
 
-                with state.lock:
-                    state.last_sync_time = time.strftime("%H:%M:%S")
-                    state.last_sync_ok = ok
-                    state.last_sync_msg = msg or ("Connected" if ok else "")
-                    if not router_clear_pending:
-                        state.rules_count = 0
+                if router_contacted:
+                    with state.lock:
+                        state.last_sync_time = time.strftime("%H:%M:%S")
+                        state.last_sync_ok = ok
+                        state.last_sync_msg = msg or ("Connected" if ok else "")
+                        if not router_clear_pending:
+                            state.rules_count = 0
 
         except Exception as e:
             logger.error("Monitor error: %s", e)
@@ -687,7 +762,8 @@ def monitor_loop(state):
                 should_sync = bool(state.sync_requested)
                 if should_sync:
                     state.sync_requested = False
-            if should_stop or should_sync:
+            flow_activity = flow_collector.consume_activity()
+            if should_stop or should_sync or flow_activity:
                 break
             time.sleep(0.5)
 

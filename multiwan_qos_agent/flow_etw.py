@@ -536,6 +536,8 @@ class EtwFlowCollector:
     def __init__(self, window_seconds=WINDOW_SECONDS):
         self.window_seconds = window_seconds
         self.lock = threading.Lock()
+        self.activity_event = threading.Event()
+        self.tracked_pids = set()
         self.flows = {}
         self.running = False
         self.available = False
@@ -611,6 +613,18 @@ class EtwFlowCollector:
             "available": self.available,
             "message": self.status_message,
         }
+
+    def consume_activity(self):
+        """Consume the new-flow wake signal used by the monitor safety loop."""
+        if not self.activity_event.is_set():
+            return False
+        self.activity_event.clear()
+        return True
+
+    def set_tracked_pids(self, pids):
+        """Limit monitor wakeups to flows owned by currently detected games."""
+        with self.lock:
+            self.tracked_pids = {int(pid) for pid in pids}
 
     def _start_session(self):
         self.props_buffer, self.props = _new_properties()
@@ -787,6 +801,7 @@ class EtwFlowCollector:
             return
 
         with self.lock:
+            tracked_pids = set(self.tracked_pids)
             for candidate_pid in candidate_pids:
                 local_port_id = int(local_port or 0)
                 key = (candidate_pid, remote_ip, int(remote_port), local_port_id)
@@ -814,6 +829,8 @@ class EtwFlowCollector:
                         "last_seen": now,
                     }
                     self.flows[key] = flow
+                    if candidate_pid in tracked_pids:
+                        self.activity_event.set()
                 flow["bytes"] += int(size)
                 flow["packets"] += 1
                 flow["last_seen"] = now
