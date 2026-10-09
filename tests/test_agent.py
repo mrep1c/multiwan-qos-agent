@@ -192,23 +192,74 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(query.call_count, 1)
             create.assert_not_called()
 
-    def test_native_udp_enum_policy_verifies_without_recreation(self):
+    def test_native_selected_port_policy_verifies_without_recreation(self):
         spec = qos.build_policy_specs("Test Game", "game.exe", None,
                                       remote_ip="8.8.8.8", remote_port=27020)[0]
         output = json.dumps({
             "Name": spec["name"].lower(), "AppPathNameMatchCondition": "game.exe",
             "IPProtocolMatchCondition": 2, "DSCPAction": 46,
-            "IPDstPrefixMatchCondition": "8.8.8.8/32",
+            "IPDstPrefixMatchCondition": "",
             "IPDstPortStartMatchCondition": 27020, "IPDstPortEndMatchCondition": 27020,
             "IPSrcPortStartMatchCondition": 0, "IPSrcPortEndMatchCondition": 0,
         })
         with patch.object(qos, "_run_powershell", return_value=(True, output)) as query, \
                 patch.object(qos, "_create_policy") as create, \
                 patch.object(qos, "remove_qos_policy_by_name") as remove:
-            self.assertTrue(qos.sync_qos_policies([spec]))
-            self.assertEqual(query.call_count, 1)
+            for _ in range(3):
+                self.assertTrue(qos.sync_qos_policies([spec]))
+            self.assertEqual(query.call_count, 3)
             create.assert_not_called()
             remove.assert_not_called()
+
+    def test_selected_port_creation_uses_temporary_executable_and_port_match(self):
+        for remote in ("162.249.75.1", "2001:db8::1"):
+            with self.subTest(remote=remote):
+                spec = qos.build_policy_specs("Valorant", "game.exe", None,
+                    remote_ip=remote, remote_port=7114, local_port=64842)[0]
+                self.assertIsNone(spec["dst_prefix"])
+                self.assertIsNone(spec["src_port"])
+                with patch.object(qos, "_run_powershell", return_value=(True, "")) as create:
+                    self.assertTrue(qos._create_policy(spec, 46))
+                command = create.call_args.args[0]
+                for condition in ("-AppPathNameMatchCondition 'game.exe'", "-IPProtocolMatchCondition UDP",
+                                  "-IPDstPortMatchCondition 7114", "-DSCPAction 46", "-PolicyStore ActiveStore"):
+                    self.assertIn(condition, command)
+                self.assertNotIn("-IPDstPrefixMatchCondition", command)
+                self.assertNotIn("-IPSrcPortMatchCondition", command)
+                self.assertEqual(qos._policy_match_description(spec), "dst_port=7114")
+        self.assertEqual(qos._policy_match_description(qos.build_policy_specs("Test", "game.exe", None)[0]), "all UDP")
+
+    def test_selected_port_verification_still_checks_native_conditions(self):
+        spec = qos.build_policy_specs("Test", "game.exe", None,
+            remote_ip="162.249.75.1", remote_port=7114)[0]
+        actual = {"app": "game.exe", "protocol": 2, "dscp": 46,
+                  "dst_prefix": "", "dst_port_start": 7114, "dst_port_end": 7114}
+        self.assertTrue(qos._policy_matches_spec(actual, spec, 46))
+        for field, value in (("app", "other.exe"), ("protocol", 1), ("dscp", 0),
+                             ("dst_port_start", 7113), ("dst_port_end", 7115),
+                             ("dst_prefix", "162.249.75.1/32"), ("src_port", 64842)):
+            with self.subTest(field=field):
+                self.assertFalse(qos._policy_matches_spec({**actual, field: value}, spec, 46))
+
+    def test_legacy_ip_policy_is_replaced_once(self):
+        spec = qos.build_policy_specs("Test", "game.exe", None,
+            remote_ip="162.249.75.1", remote_port=7114)[0]
+        legacy_name = qos._policy_name("Test", "game.exe", dst_prefix="162.249.75.1/32", dst_port=7114)
+        actual = {"name": spec["name"], "app": "game.exe", "protocol": 2, "dscp": 46,
+                  "dst_prefix": "", "dst_port_start": 7114, "dst_port_end": 7114}
+        with patch.object(qos, "get_active_policies", side_effect=[[{**actual, "name": legacy_name}], [actual], [actual]]), \
+                patch.object(qos, "remove_qos_policy_by_name", return_value=True) as remove, \
+                patch.object(qos, "_create_policy", return_value=True) as create:
+            self.assertTrue(qos.sync_qos_policies([spec]))
+            self.assertTrue(qos.sync_qos_policies([spec]))
+            remove.assert_called_once_with(legacy_name)
+            create.assert_called_once_with(spec, 46)
+
+    def test_selected_port_specs_still_reject_invalid_remote_endpoints(self):
+        for remote, port in (("invalid", 7114), (None, 7114), ("162.249.75.1", 65536)):
+            with self.subTest(remote=remote, port=port):
+                self.assertEqual(qos.build_policy_specs("Test", "game.exe", None,
+                    remote_ip=remote, remote_port=port), [])
 
     def test_native_non_udp_protocols_do_not_match_udp_policy(self):
         spec = qos.build_policy_specs("Test Game", "game.exe", None)[0]
@@ -577,7 +628,11 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(candidates), 4)
         specs = app._build_policy_specs(DETECTED, report,
             local_tagging_mode=cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS)
-        self.assertEqual({s["dst_prefix"] for s in specs}, {"8.8.8.8/32", "1.1.1.1/32"})
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["dst_port"], 27015)
+        self.assertIsNone(specs[0]["dst_prefix"])
+        self.assertEqual({f["remote_ip"] for f in app._router_rule_connections(report, DETECTED, {})},
+                         {"8.8.8.8", "1.1.1.1"})
 
     def test_default_selection_ranks_bandwidth_before_packet_rate(self):
         clock = Clock(0)

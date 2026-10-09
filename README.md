@@ -16,7 +16,7 @@ The router endpoint is:
   user entries.
 - Applies Windows QoS policies for local DSCP tagging. The default marks all
   UDP traffic from detected game executables, with an optional stricter mode for
-  selected live flows.
+  selected live UDP destination ports.
 - Uses Windows ETW UDP telemetry to identify remote game endpoints, with
   automatic retries after telemetry failures.
 - Syncs active game connection metadata to the OpenWrt router.
@@ -28,8 +28,14 @@ The router endpoint is:
 - Supports Start with Windows through Task Scheduler.
 - Stores config and logs under the current Windows user profile.
 
-Local tagging covers every detected executable belonging to a game. Selected
-live-flow policies use the executable that owns each flow. Windows policy
+Local tagging covers every detected executable belonging to a game. Selected-port
+policies use the executable that owns each selected flow and its UDP destination
+port. Windows tagging cannot match the server IP: other UDP traffic from that
+executable to the same port can also be tagged. Router rules still match exact
+selected endpoints. Windows policies remain temporary in ActiveStore; affected
+Windows systems drop destination IP filters in that store. The settings and live
+dashboard display this limitation. Flows sharing an executable and destination
+port share one Windows policy. Windows policy
 state is verified after changes and checked every 60 seconds to repair missing
 or changed policies. Changing the router address, credentials, TLS setting or
 PC address forces a fresh router synchronization.
@@ -47,7 +53,7 @@ intentional selection rules. Game process ownership alone does not qualify a
 connection. Audits and refactors must preserve these rules unless a selection
 design change is explicitly requested. The dashboard may show ignored
 candidates for diagnosis; only selected flows reach the router report and
-exact-flow policy builder. See [AGENTS.md](AGENTS.md).
+selected-port policy builder. See [AGENTS.md](AGENTS.md).
 
 The agent sends connection metadata needed for router QoS rules. It does not
 inspect packet payloads.

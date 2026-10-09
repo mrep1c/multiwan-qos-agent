@@ -79,3 +79,32 @@ locally on 2026-10-10; live match-server selection remains unchecked.
 These filters are intentional design, not defects. Repository `AGENTS.md`,
 selection comments and regression tests now record that audits and refactors
 must preserve them unless the user explicitly requests a selection change.
+
+## Temporary Windows policy compatibility
+
+The user's v1.0.13 ActiveStore output showed the correct executable, native UDP
+enum `2`, selected destination port `7114` and DSCP `46`, but an empty destination
+IP prefix. Desired policies still required the server IP, so verification failed
+and removed/recreated the policy about every ten seconds. This matches the
+[reported NetQos ActiveStore limitation](https://github.com/PowerShell/PowerShell/issues/25486).
+
+At the user's request, selected-port mode now creates temporary ActiveStore
+policies matching the owning game executable and selected UDP destination port.
+It does not request a server IP condition. Settings, the live dashboard and the
+README explain that other UDP traffic from that executable to the same port can
+also receive Windows tagging. Router rules retain exact selected IP addresses
+and ports. The all-UDP default, selection thresholds, ranking, warmup and
+three-flow cap are unchanged.
+
+Policy names reflect the actual executable/port match, so selected flows sharing
+that match reuse one policy. Existing managed IP-based names are removed during
+the next synchronization. Verification still checks the executable, UDP, DSCP,
+destination port and absence of unintended IP/source-port restrictions. The
+user's empty-IP/native-port output verifies repeatedly without policy churn.
+
+All 63 tests passed locally on 2026-10-10, including IPv4/IPv6 command generation,
+repeated native verification, one-time migration, invalid endpoint rejection,
+and preservation of exact router metadata and selection filters. Live native
+creation, packet DSCP capture and GUI layout still require the packaged app.
+This fixes the confirmed verification loop; it does not establish the cause of
+the reported hit-registration problem.

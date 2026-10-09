@@ -260,9 +260,8 @@ def build_policy_specs(game_name, exe_name, ports, remote_ip=None, remote_port=N
         return []
 
     if remote_ip or remote_port:
-        dst_prefix = _normalize_ip_prefix(remote_ip)
         dst_port = _normalize_port(remote_port)
-        if not dst_prefix or not dst_port:
+        if not _normalize_ip_prefix(remote_ip) or not dst_port:
             logger.warning(
                 "Skipping QoS live-flow policy for %s: invalid remote endpoint %s:%s",
                 game_name,
@@ -271,24 +270,16 @@ def build_policy_specs(game_name, exe_name, ports, remote_ip=None, remote_port=N
             )
             return []
 
-        # Keep exact mode anchored on the remote endpoint. Game-side UDP source
-        # ports can churn and make Windows policy matching miss active traffic.
-        src_port = None
+        # ActiveStore drops server IP filters; scope temporary policies to executable + port.
         return [{
-            "name": _policy_name(
-                game_name,
-                exe_name,
-                dst_prefix=dst_prefix,
-                dst_port=dst_port,
-                src_port=src_port,
-            ),
+            "name": _policy_name(game_name, exe_name, dst_port=dst_port),
             "game": game_name,
             "exe": exe_name,
             "start_port": None,
             "end_port": None,
-            "dst_prefix": dst_prefix,
+            "dst_prefix": None,
             "dst_port": dst_port,
-            "src_port": src_port,
+            "src_port": None,
         }]
 
     return [{
@@ -304,13 +295,12 @@ def build_policy_specs(game_name, exe_name, ports, remote_ip=None, remote_port=N
 
 
 def _policy_match_description(spec):
-    if not spec.get("dst_prefix"):
-        return "all UDP"
-
-    parts = [f"dst={spec.get('dst_prefix')}"]
+    parts = []
+    if spec.get("dst_prefix"):
+        parts.append(f"dst={spec.get('dst_prefix')}")
     if spec.get("dst_port"):
         parts.append(f"dst_port={spec.get('dst_port')}")
-    return ", ".join(parts)
+    return ", ".join(parts) or "all UDP"
 
 
 def _create_policy(spec, dscp_value):

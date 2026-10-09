@@ -174,7 +174,7 @@ def _build_policy_specs(
                 local_port=conn.get("local_port"),
             ))
 
-        return specs
+        return list({spec["name"]: spec for spec in specs}.values())
 
     for game_name, game_data in detected.items():
         if not _game_allows_local_tagging(game_data, game_rules, local_tagging_enabled):
@@ -1288,6 +1288,8 @@ class DashboardWindow:
         self.dscp_combo.bind("<<ComboboxSelected>>", self._save_dscp_selection)
         self.lbl_pc_ip = ttk.Label(dscp_frame, text="", style="Dark.TLabel")
         self.lbl_pc_ip.pack(side="right")
+        self.lbl_tagging = ttk.Label(main, text="", style="Dark.TLabel", wraplength=760)
+        self.lbl_tagging.pack(anchor="w", pady=(6, 0))
 
         self._refresh()
         self.root.lift()
@@ -1304,6 +1306,13 @@ class DashboardWindow:
         self.lbl_games.config(text=f"Games: {n_games}")
         self.lbl_rules.config(text=f"Router Rules: {snap['rules_count']}")
         self._refresh_dscp_selection(snap.get("dscp_value"))
+        if not snap.get("local_tagging_enabled"):
+            tagging_text = "Windows tagging: disabled."
+        elif snap.get("local_tagging_mode") == cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS:
+            tagging_text = cfg.LOCAL_TAGGING_LIVE_PORT_NOTICE
+        else:
+            tagging_text = f"Windows tagging: {cfg.local_tagging_mode_label(snap.get('local_tagging_mode'))}."
+        self.lbl_tagging.config(text=tagging_text)
         flow_status = snap.get("flow_status", {})
         detector_style = "Status.TLabel" if flow_status.get("available") else "Warn.TLabel"
         self.lbl_detector.config(
@@ -1385,7 +1394,7 @@ def show_settings(state, parent):
     def _run():
         root = tk.Toplevel(parent)
         root.title("MultiWAN QoS Agent — Settings")
-        root.geometry("460x470")
+        root.geometry("460x550")
         root.resizable(False, False)
         root.update_idletasks()
         root.tk.call("tk::PlaceWindow", root._w, "center")
@@ -1450,6 +1459,8 @@ def show_settings(state, parent):
             state="readonly",
             width=28,
         ).pack(side="left", fill="x", expand=True)
+
+        ttk.Label(frame, text=cfg.LOCAL_TAGGING_LIVE_PORT_NOTICE, wraplength=410).pack(anchor="w", pady=(6, 0))
 
         # Auto-start
         auto_start_value = is_autostart_enabled()

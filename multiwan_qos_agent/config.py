@@ -46,6 +46,10 @@ LOCAL_TAGGING_MODE_LIVE_FLOWS = "live_flows"
 LOCAL_TAGGING_MODE_ALL_UDP = "all_udp"
 LOCAL_TAGGING_MODES = {LOCAL_TAGGING_MODE_LIVE_FLOWS, LOCAL_TAGGING_MODE_ALL_UDP}
 LOCAL_TAGGING_MODE_MIGRATION_VERSION = 1
+LOCAL_TAGGING_LIVE_PORT_NOTICE = (
+    "Selected-port mode: Windows cannot match the server IP. UDP from the same "
+    "executable to the selected port is tagged for any server. Router rules keep exact endpoints."
+)
 LOCAL_TAGGING_RULE_GLOBAL = "global"
 LOCAL_TAGGING_RULE_ENABLED = "enabled"
 LOCAL_TAGGING_RULE_DISABLED = "disabled"
@@ -115,7 +119,7 @@ def local_tagging_mode_label(value):
     value = normalize_local_tagging_mode(value)
     if value == LOCAL_TAGGING_MODE_ALL_UDP:
         return "All UDP from detected game executable"
-    return "Selected live flows only"
+    return "Selected live UDP ports"
 
 
 def local_tagging_mode_from_label(label):
