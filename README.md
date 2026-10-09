@@ -17,17 +17,30 @@ The router endpoint is:
 - Applies Windows QoS policies for local DSCP tagging. The default marks all
   UDP traffic from detected game executables, with an optional stricter mode for
   selected live flows.
-- Uses UDP flow telemetry and psutil connection inspection to identify live
-  remote game endpoints.
+- Uses Windows ETW UDP telemetry to identify remote game endpoints, with
+  automatic retries after telemetry failures.
 - Syncs active game connection metadata to the OpenWrt router.
-- Signals verified new live-flow sessions so router Adaptive mode can restore
-  its session-start baseline without waiting for an aggregate idle timeout.
+- Signals new live-flow sessions to the router's Adaptive controller.
 - Scans for games every 2 seconds while idle, wakes on new ETW game flows, and
   uses 5-second active synchronization with a slower idle heartbeat.
 - Clears router-side agent rules when games stop or the app exits.
 - Provides a tray app, live dashboard, settings dialog, and custom game editor.
 - Supports Start with Windows through Task Scheduler.
 - Stores config and logs under the current Windows user profile.
+
+Local tagging covers every detected executable belonging to a game. Selected
+live-flow policies use the executable that owns each flow. Windows policy
+state is verified after changes and checked every 60 seconds to repair missing
+or changed policies. Changing the router address, credentials, TLS setting or
+PC address forces a fresh router synchronization.
+
+Flow selection uses recent packet activity and bandwidth over a 45-second
+window. A flow needs three packets and three seconds of observation; there is
+no default minimum bandwidth or fraction-of-largest-flow cutoff. The existing
+limit of three selected flows per game remains. ETW retries use delays bounded
+between 5 and 60 seconds. Windows psutil UDP tables cannot provide remote
+endpoints, so router flow detection requires working ETW telemetry; default
+all-UDP local tagging still works when ETW is unavailable.
 
 The agent sends connection metadata needed for router QoS rules. It does not
 inspect packet payloads.
@@ -90,10 +103,10 @@ Tagged releases are built by GitHub Actions and include a ready-to-run Windows
 EXE asset. Non-release workflow runs also publish the EXE as a workflow
 artifact.
 
-Current asset:
+Release asset naming:
 
 ```text
-MultiWAN-QoS-Agent-v1.0.4-windows-x64.exe
+MultiWAN-QoS-Agent-v<version>-windows-x64.exe
 ```
 
 Run the EXE as administrator. Windows may show a SmartScreen warning because
@@ -109,6 +122,12 @@ First setup:
    default all-UDP mode for the most stable local game tagging.
 5. Save settings.
 6. Start a supported game and check the Live Dashboard.
+
+HTTPS certificate verification is enabled by default. If a trusted router uses
+a self-signed certificate, explicitly select `Allow insecure HTTPS certificates`;
+this skips verification of the router's identity. Entering an HTTPS address does
+not enable that option automatically. Redirects and invalid agent JSON replies
+are rejected. Older valid agent JSON responses remain supported.
 
 ## Config And Logs
 
@@ -136,6 +155,17 @@ Log file:
 %APPDATA%\MultiWAN QoS Agent\agent.log
 ```
 
+Settings, custom games and overrides are written to a temporary file and
+atomically replaced only after a complete write. A failed save keeps the previous
+file and reports the error. API keys require successful Windows DPAPI encryption
+before saving; encryption failures never save the key as plaintext. Old plaintext
+keys can still be read and are encrypted on the next successful save.
+
+Malformed settings load safe defaults or skip invalid entries and show a startup
+warning. The original file stays in place until an explicit repair saves a copy
+as `<filename>.invalid-<id>` before replacement. An unreadable encrypted key also
+raises a warning and requires re-entry in Settings.
+
 ## Game Rules
 
 Use the Game Rules editor to control local Windows DSCP tagging for built-in
@@ -145,6 +175,11 @@ overrides. Custom entries should include:
 - display name,
 - executable name,
 - expected protocol.
+
+Names must contain 1–64 ASCII letters, numbers, spaces, hyphens, underscores,
+colons or dots so the router can accept them. Paste executable basenames such as
+`game.exe` or Windows paths; paths are normalized to basenames before saving.
+Duplicate display names are rejected by the editor. Traffic remains UDP-only.
 
 Each game can use the global local-tagging setting, explicitly enable local
 tagging, or disable local tagging. `Disable local tagging` only removes the
@@ -158,8 +193,7 @@ Select `Use global setting` and save to remove a per-game override. `Delete
 Game` removes a custom game definition and its override; built-in games remain
 available.
 
-After changing custom games or game rules, restart detection from the tray app
-or restart the agent.
+Saved changes wake detection automatically.
 
 ## Run From Source
 
@@ -173,6 +207,17 @@ python run_agent.py
 ```
 
 Run PowerShell as administrator when testing DSCP policy creation.
+
+Run the regression checks without administrator rights or installed app dependencies:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The tests replace Windows APIs, HTTP, credentials and UI dependencies with mocks.
+They do not launch ETW, alter policies or scheduled tasks, contact a router, or
+open the UI. CI runs them before packaging. See `docs/pc-agent-audit-fixes.md` for
+the audit resolution and remaining live checks.
 
 ## Build From Source
 
@@ -211,6 +256,8 @@ If the Live Dashboard is empty:
 - Confirm the game is using network traffic.
 - Add the game manually in Game Rules if needed.
 - Confirm the router can receive agent updates.
+- Check the ETW status. Failed telemetry retries automatically; Windows UDP
+  endpoint detection has no psutil fallback.
 
 ## Uninstall
 
@@ -222,7 +269,10 @@ If the Live Dashboard is empty:
 %APPDATA%\MultiWAN QoS Agent
 ```
 
-Router-side agent rules are cleared when the app exits normally. Restart
+Normal exit waits for accepted rule writes before cleanup and rejects further
+writes. Slow Windows policy commands can delay exit; check the log if cleanup
+fails. Router-side agent cleanup uses the last contacted router and PC address.
+Restart
 MultiWAN QoS if you want to clear router-side state manually:
 
 ```sh

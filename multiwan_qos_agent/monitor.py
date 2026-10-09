@@ -12,6 +12,7 @@ import socket
 from urllib.parse import urlparse
 
 import psutil
+from . import config as cfg
 
 logger = logging.getLogger("multiwan_qos_agent.monitor")
 
@@ -23,11 +24,20 @@ def load_game_database():
 
     if os.path.exists(db_path):
         try:
-            with open(db_path, "r") as f:
+            with open(db_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
-                games.extend(data.get("games", []))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to load built-in game database: %s", e)
+                if not isinstance(data, dict) or not isinstance(data.get("games"), list):
+                    raise ValueError("Built-in games must be a JSON object containing a games list")
+                games.extend(game for game in data["games"] if isinstance(game, dict)
+                             and cfg.valid_game_name(game.get("name"))
+                             and isinstance(game.get("executables"), list)
+                             and game["executables"]
+                             and all(isinstance(exe, str) and cfg.normalize_executable_name(exe) == exe
+                                     for exe in game["executables"]))
+                if len(games) != len(data["games"]):
+                    cfg._load_warning(db_path, "Invalid built-in game entries were skipped")
+        except (ValueError, UnicodeError, OSError) as e:
+            cfg._load_warning(db_path, e)
 
     return games
 
@@ -36,8 +46,11 @@ def get_all_game_executables(game_db, user_games):
     """Build a lookup dict: lowercase exe name -> game info."""
     exe_map = {}
     for game in game_db + user_games:
+        if not isinstance(game, dict) or not isinstance(game.get("executables"), list):
+            continue
         for exe in game.get("executables", []):
-            exe_map[exe.lower()] = game
+            if isinstance(exe, str):
+                exe_map[exe.lower()] = game
     return exe_map
 
 
@@ -61,8 +74,13 @@ def find_running_games(exe_map):
                     "pids": [],
                     "game_info": game_info,
                     "exe_name": proc_name,
+                    "exe_names": [],
+                    "pid_exes": {},
                 }
             detected[game_name]["pids"].append(proc.info["pid"])
+            detected[game_name]["pid_exes"][proc.info["pid"]] = proc_name
+            if proc_name not in detected[game_name]["exe_names"]:
+                detected[game_name]["exe_names"].append(proc_name)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
@@ -100,11 +118,10 @@ def _local_ip_for_target(host, port):
 
     for family, socktype, proto, _canon, sockaddr in infos:
         try:
-            s = socket.socket(family, socktype, proto)
-            s.settimeout(0.2)
-            s.connect(sockaddr)
-            local_ip = s.getsockname()[0]
-            s.close()
+            with socket.socket(family, socktype, proto) as s:
+                s.settimeout(0.2)
+                s.connect(sockaddr)
+                local_ip = s.getsockname()[0]
             if local_ip and not local_ip.startswith("127."):
                 return local_ip
         except (socket.error, OSError):
@@ -122,11 +139,10 @@ def get_local_ip(router_ip=None):
             return local_ip
 
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.1)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.1)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
         return local_ip
     except (socket.error, OSError):
         return None
@@ -134,6 +150,9 @@ def get_local_ip(router_ip=None):
 
 def get_process_connections(pids):
     """Get active UDP network connections for given process IDs."""
+    # Windows UDP tables expose no remote address; ETW supplies server endpoints.
+    if os.name == "nt":
+        return []
     connections = []
     seen = set()
 
@@ -157,6 +176,7 @@ def get_process_connections(pids):
                 seen.add(key)
 
                 connections.append({
+                    "pid": pid,
                     "proto": "udp",
                     "remote_ip": remote_ip,
                     "remote_port": conn.raddr.port,
@@ -173,6 +193,7 @@ def get_process_connections(pids):
 def _etw_connection_entry(game_name, flow):
     return {
         "game": game_name,
+        "pid": flow.get("pid"),
         "proto": "udp",
         "remote_ip": flow["remote_ip"],
         "remote_port": flow["remote_port"],
@@ -187,6 +208,7 @@ def _etw_connection_entry(game_name, flow):
 def _ignored_flow_entry(game_name, flow):
     return {
         "game": game_name,
+        "pid": flow.get("pid"),
         "proto": "udp",
         "remote_ip": flow.get("remote_ip", ""),
         "remote_port": flow.get("remote_port", ""),
@@ -256,6 +278,7 @@ def build_connection_report(detected_games, flow_collector=None):
             for conn in live_conns:
                 report.append({
                     "game": game_name,
+                    "pid": conn.get("pid"),
                     "proto": "udp",
                     "remote_ip": conn["remote_ip"],
                     "remote_port": conn["remote_port"],

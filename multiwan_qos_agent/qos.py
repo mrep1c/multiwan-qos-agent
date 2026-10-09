@@ -40,7 +40,7 @@ def _run_powershell(command):
                 "-WindowStyle",
                 "Hidden",
                 "-Command",
-                command,
+                "$ErrorActionPreference = 'Stop'; " + command,
             ],
             capture_output=True,
             text=True,
@@ -95,7 +95,7 @@ def _validate_dscp_value(dscp_value):
 
 
 def _validate_exe_name(exe_name):
-    return bool(re.match(r"^[\w\-. ]+\.exe$", exe_name or "", re.IGNORECASE))
+    return cfg.normalize_executable_name(exe_name) == exe_name and bool(exe_name)
 
 
 def _normalize_port(value):
@@ -373,17 +373,7 @@ def _create_policy(spec, dscp_value):
 
 def get_multiwan_qos_policy_names():
     """List MultiWAN QoS-managed Windows QoS policy names."""
-    list_cmd = (
-        f'Get-NetQosPolicy -PolicyStore {POLICY_STORE} | '
-        f'Where-Object {{ $_.Name -like "{POLICY_PREFIX}*" }} '
-        f"| Select-Object -ExpandProperty Name"
-    )
-
-    success, output = _run_powershell(list_cmd)
-    if not success or not output:
-        return set()
-
-    return {line.strip() for line in output.strip().splitlines() if line.strip()}
+    return {policy["name"] for policy in get_active_policies()}
 
 
 def remove_qos_policy_by_name(policy_name):
@@ -395,7 +385,7 @@ def remove_qos_policy_by_name(policy_name):
     remove_cmd = (
         f"Remove-NetQosPolicy -Name {_ps_quote(policy_name)} "
         f"-PolicyStore {POLICY_STORE} "
-        f"-Confirm:$false -ErrorAction SilentlyContinue"
+        f"-Confirm:$false -ErrorAction Stop"
     )
 
     success, output = _run_powershell(remove_cmd)
@@ -412,42 +402,36 @@ def sync_qos_policies(desired_specs, dscp_value=46):
     dscp_value = _validate_dscp_value(dscp_value)
 
     desired_by_key = {_policy_key(spec["name"]): spec for spec in desired_specs}
-    active_details = {_policy_key(policy["name"]): policy for policy in get_active_policies()}
-    active_keys = set(active_details.keys())
+    def matches(actual):
+        return actual.keys() == desired_by_key.keys() and all(
+            _policy_matches_spec(actual[key], spec, dscp_value)
+            for key, spec in desired_by_key.items())
 
-    ok = True
-    for policy_key in sorted(active_keys - set(desired_by_key.keys())):
-        policy_name = active_details[policy_key]["name"]
-        if not remove_qos_policy_by_name(policy_name):
-            ok = False
-
-    active_details = {_policy_key(policy["name"]): policy for policy in get_active_policies()}
-    active_keys = set(active_details.keys())
-    for policy_key, spec in sorted(desired_by_key.items()):
-        policy_name = spec["name"]
-        if policy_key in active_keys:
-            active_policy = active_details.get(policy_key)
-            if _policy_matches_spec(active_policy, spec, dscp_value):
+    try:
+        active_details = {_policy_key(policy["name"]): policy for policy in get_active_policies()}
+        if matches(active_details):
+            return True
+        ok = True
+        for key in sorted(active_details.keys() - desired_by_key.keys()):
+            if not remove_qos_policy_by_name(active_details[key]["name"]):
+                ok = False
+        for key, spec in sorted(desired_by_key.items()):
+            active = active_details.get(key)
+            if _policy_matches_spec(active, spec, dscp_value):
                 continue
-            logger.info(
-                "Recreating QoS policy %s because existing policy does not match desired match conditions",
-                policy_name,
-            )
-            if not remove_qos_policy_by_name(active_policy.get("name", policy_name)):
+            if active and not remove_qos_policy_by_name(active["name"]):
                 ok = False
                 continue
-        if not _create_policy(spec, dscp_value):
-            ok = False
-
-    remaining = {
-        name for name in get_multiwan_qos_policy_names()
-        if _policy_key(name) not in set(desired_by_key.keys())
-    }
-    if remaining:
-        logger.warning("Stale MultiWAN QoS Agent QoS policies remain after sync: %s", ", ".join(sorted(remaining)))
-        ok = False
-
-    return ok
+            if not _create_policy(spec, dscp_value):
+                ok = False
+        actual = {_policy_key(policy["name"]): policy for policy in get_active_policies()}
+        if not matches(actual):
+            logger.warning("Windows QoS policies do not match the desired state after sync")
+            return False
+        return ok
+    except RuntimeError as e:
+        logger.warning("Windows QoS state could not be verified: %s", e)
+        return False
 
 
 def create_qos_policy(game_name, exe_name, dscp_value=46):
@@ -465,7 +449,11 @@ def cleanup_all_policies():
     """Remove all MultiWAN QoS Agent policies."""
     logger.info("Cleaning up all MultiWAN QoS Agent QoS policies...")
 
-    policy_names = get_multiwan_qos_policy_names()
+    try:
+        policy_names = get_multiwan_qos_policy_names()
+    except RuntimeError as e:
+        logger.warning("Windows QoS cleanup could not read policy state: %s", e)
+        return {"removed": 0, "remaining": ["unknown"], "failed": ["policy query failed"]}
     if not policy_names:
         logger.debug("No MultiWAN QoS Agent policies found to clean up")
         return {"removed": 0, "remaining": [], "failed": []}
@@ -478,7 +466,11 @@ def cleanup_all_policies():
         else:
             failed.append(policy_name)
 
-    remaining = sorted(get_multiwan_qos_policy_names())
+    try:
+        remaining = sorted(get_multiwan_qos_policy_names())
+    except RuntimeError:
+        remaining = ["unknown"]
+        failed.append("policy verification failed")
     if remaining:
         logger.warning("QoS cleanup removed %d policy/policies; remaining stale policies: %s", removed, ", ".join(remaining))
     else:
@@ -500,13 +492,21 @@ def get_active_policies():
     )
 
     success, output = _run_powershell(list_cmd)
-    if not success or not output:
+    if not success:
+        raise RuntimeError("Windows QoS query failed")
+    if not output:
         return []
 
     try:
         data = json.loads(output)
+        if data is None:
+            return []
         if isinstance(data, dict):
             data = [data]
+        if not isinstance(data, list) or any(
+                not isinstance(p, dict) or not isinstance(p.get("Name"), str)
+                or not _is_multiwan_qos_policy_name(p["Name"]) for p in data):
+            raise ValueError("Invalid Windows QoS policy records")
         return [
             {
                 "name": p.get("Name", ""),
@@ -523,5 +523,5 @@ def get_active_policies():
             }
             for p in data
         ]
-    except (json.JSONDecodeError, TypeError):
-        return []
+    except (ValueError, TypeError) as e:
+        raise RuntimeError("Invalid Windows QoS query response") from e

@@ -49,39 +49,59 @@ def _endpoint_urls(router_ip):
 def _response_message(response, default=None):
     """Extract a useful message from a router response."""
     fallback = default or f"HTTP {response.status_code}"
-    try:
-        return response.json().get("message", fallback)
-    except ValueError:
-        if response.status_code == 404:
-            return (
-                "MultiWAN QoS Agent endpoint was not found on the router. "
-                "Upgrade or reinstall the multiwan-qos package."
-            )
-        text = _compact_router_text(_strip_html(response.text), limit=160)
-        return text if text else fallback
+    message = _response_json(response).get("message")
+    if isinstance(message, str) and message:
+        return message
+    if response.status_code == 200:
+        return "Invalid router agent JSON response"
+    if response.status_code == 404:
+        return (
+            "MultiWAN QoS Agent endpoint was not found on the router. "
+            "Upgrade or reinstall the multiwan-qos package."
+        )
+    text = _compact_router_text(_strip_html(response.text), limit=160)
+    return text if text else fallback
 
 
 def _response_json(response):
     try:
-        return response.json()
+        data = response.json()
+        return data if isinstance(data, dict) else {}
     except ValueError:
         return {}
 
 
 def _to_int(value):
+    if isinstance(value, bool):
+        return None
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        result = int(value)
+        return None if isinstance(value, float) and value != result else result
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
-def _effective_status_code(response):
+def _effective_status_code(response, action=None):
+    if not 200 <= response.status_code < 300:
+        return response.status_code
     data = _response_json(response)
     status = _to_int(data.get("status"))
-    if status is not None:
+    if status is not None and 400 <= status <= 599:
         return status
     if str(data.get("message", "")).lower() == "too many requests":
         return 429
+    response_action = data.get("action")
+    version = _to_int(data.get("endpoint_version"))
+    if action and response_action is not None and response_action != action:
+        return 502
+    if version is not None and version >= 2:
+        if response_action not in ("update", "clear", "disconnect", "heartbeat"):
+            return 502
+    elif not re.match(r"^(?:OK(?::|$)|Rules cleared|Disconnected|Heartbeat OK)",
+                      str(data.get("message", "")), re.IGNORECASE):
+        return 502
+    if status not in (None, 200):
+        return 502
     return response.status_code
 
 
@@ -125,7 +145,7 @@ def _structured_update_validation(response, message):
     """Return (ok, detail) for router verification metadata when present."""
     data = _response_json(response)
     if not data:
-        return True, "legacy response"
+        return False, "Invalid router agent JSON response"
 
     verification_present = (
         "verification_ok" in data or
@@ -135,6 +155,8 @@ def _structured_update_validation(response, message):
         "dscp_rule_count" in data or
         "rule_shape" in data
     )
+    if not verification_present and (_to_int(data.get("endpoint_version")) or 0) >= 2:
+        return False, "Router update response is missing verification metadata"
     if not verification_present:
         return True, "legacy json response"
 
@@ -145,6 +167,10 @@ def _structured_update_validation(response, message):
     dscp_count = _to_int(data.get("dscp_rule_count"))
     verification_ok = data.get("verification_ok")
     verification_status = data.get("verification_status") or "unknown"
+
+    if endpoint_version is not None and endpoint_version >= 2:
+        if verification_ok is None or expected is None or expected < 0:
+            return False, f"router verification failed: {verification_status} (missing or invalid verification metadata)"
 
     if endpoint_version is not None and endpoint_version < 2:
         return False, f"router agent endpoint is too old (version {endpoint_version})"
@@ -162,6 +188,9 @@ def _structured_update_validation(response, message):
             return False, f"router verification failed: {verification_status} ({counts}; nft={preview})"
         return False, f"router verification failed: {verification_status} ({counts})"
 
+    if endpoint_version is not None and endpoint_version >= 2 and verification_ok is not True:
+        return False, "Router update response has invalid verification metadata"
+
     if expected is not None:
         for label, value in (
             ("verified rules", rule_count),
@@ -171,7 +200,7 @@ def _structured_update_validation(response, message):
             if value is not None and value != expected:
                 return False, f"router verification mismatch: {label}={value}, expected={expected}"
 
-    if expected and (rule_count is None or agent_rule_count is None or dscp_count is None):
+    if expected is not None and (rule_count is None or agent_rule_count is None or dscp_count is None):
         return False, "router verification response is missing expected rule metadata"
 
     return True, (
@@ -196,7 +225,8 @@ def _do_request(router_ip, payload, timeout=REQUEST_TIMEOUT, insecure_tls=False)
                 json=payload,
                 timeout=timeout,
                 headers={"Content-Type": "application/json"},
-                verify=not (url.startswith("https://") and insecure_tls)
+                verify=not (url.startswith("https://") and insecure_tls),
+                allow_redirects=False,
             )
             response.multiwan_qos_url = url
             return response, ""
@@ -241,7 +271,7 @@ def send_update(router_ip, api_key, pc_ip, connections, dscp_value=46,
         logger.warning(err)
         return _sync_result(False, err, detail=err)
 
-    status_code = _effective_status_code(response)
+    status_code = _effective_status_code(response, "update")
     if status_code == 200:
         msg = _response_message(response, "OK")
         rule_count = _response_rule_count(response, msg)
@@ -277,9 +307,11 @@ def send_clear(router_ip, api_key, pc_ip, insecure_tls=False):
         logger.warning("Failed to clear router rules: %s", err)
         return _sync_result(False, err, detail=err)
 
-    status_code = _effective_status_code(response)
+    status_code = _effective_status_code(response, "clear")
     if status_code == 200:
         msg = _response_message(response, "Rules cleared")
+        if _response_rule_count(response, msg) not in (None, 0):
+            return _sync_result(False, "Router clear left active rules", response)
         logger.info("Router rules cleared: %s", msg)
         return _sync_result(True, msg, response, rule_count=0)
     else:
@@ -300,7 +332,8 @@ def send_disconnect(router_ip, api_key, pc_ip, timeout=REQUEST_TIMEOUT, insecure
         logger.debug("Disconnect failed: %s", err)
         return _sync_result(False, err, detail=err)
 
-    success = _effective_status_code(response) == 200
+    success = (_effective_status_code(response, "disconnect") == 200 and
+               _response_rule_count(response, "") in (None, 0))
     msg = _response_message(response, "Disconnected" if success else None)
     if success:
         logger.info("Router agent disconnected: %s", msg)
@@ -321,7 +354,7 @@ def send_heartbeat(router_ip, api_key, pc_ip, insecure_tls=False):
         logger.debug("Heartbeat failed: %s", err)
         return _sync_result(False, err, detail=err)
 
-    success = _effective_status_code(response) == 200
+    success = _effective_status_code(response, "heartbeat") == 200
     rule_count = None
     if success:
         msg = _response_message(response, "Heartbeat OK")
@@ -355,7 +388,7 @@ def test_connection(router_ip, api_key, pc_ip=None, insecure_tls=False):
     if response is None:
         return False, err
 
-    status_code = _effective_status_code(response)
+    status_code = _effective_status_code(response, "heartbeat")
     if status_code == 200:
         return True, "Connection successful"
     elif status_code == 401:

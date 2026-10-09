@@ -26,6 +26,9 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Run agent regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build executable
         shell: cmd
         env:

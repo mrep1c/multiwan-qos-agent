@@ -4,14 +4,19 @@ import logging
 import base64
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
+import tempfile
+import threading
+import uuid
 
 try:
     import win32crypt
     HAS_WIN32CRYPT = True
 except ImportError:
+    win32crypt = None
     HAS_WIN32CRYPT = False
 
 logger = logging.getLogger("multiwan_qos_agent.config")
@@ -19,6 +24,10 @@ logger = logging.getLogger("multiwan_qos_agent.config")
 APP_NAME = "MultiWAN QoS Agent"
 LEGACY_APP_NAME = "Qo" + "Smate Agent"
 DPAPI_DESCRIPTION = "MultiWAN QoS"
+LOAD_WARNINGS = []
+LAST_SAVE_ERROR = ""
+_invalid_files = set()
+_file_lock = threading.RLock()
 
 DSCP_CLASSES = [
     {"name": "EF", "value": 46, "token": "ef", "queue": "Realtime"},
@@ -67,7 +76,7 @@ def normalize_dscp_value(value):
     """Return a MultiWAN QoS-supported DSCP value, defaulting to EF."""
     try:
         value = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_DSCP_VALUE
     if value in SUPPORTED_DSCP_VALUES:
         return value
@@ -168,7 +177,8 @@ def _slug(value):
 
 
 def game_id(game, source="game"):
-    explicit = str(game.get("id", "") if isinstance(game, dict) else "").strip().lower()
+    explicit = game.get("id", "") if isinstance(game, dict) else ""
+    explicit = explicit.strip().lower() if isinstance(explicit, str) else ""
     if explicit:
         return explicit
     if not isinstance(game, dict):
@@ -176,7 +186,9 @@ def game_id(game, source="game"):
     executables = game.get("executables", [])
     if isinstance(executables, str):
         executables = [executables]
-    seed_items = [str(item).strip().lower() for item in executables if str(item).strip()]
+    if not isinstance(executables, list):
+        executables = []
+    seed_items = [item.strip().lower() for item in executables if isinstance(item, str) and item.strip()]
     seed = "|".join(sorted(seed_items)) or str(game.get("name", "game")).strip().lower()
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
     return f"{_slug(source)}_{digest}"
@@ -202,19 +214,20 @@ def get_config_path():
 
 
 def _encrypt_api_key(api_key):
-    if not api_key or not HAS_WIN32CRYPT:
+    if not api_key:
         return api_key
-    if api_key.startswith("dpapi:"):
-        return api_key
+    if not HAS_WIN32CRYPT:
+        raise ValueError("Windows DPAPI support is unavailable; the API key was not saved")
     try:
         encrypted = win32crypt.CryptProtectData(api_key.encode('utf-8'), DPAPI_DESCRIPTION)
         return "dpapi:" + base64.b64encode(encrypted).decode('utf-8')
     except Exception as e:
-        logger.error("Failed to encrypt API key: %s", e)
-        return api_key
+        raise ValueError("API key encryption failed; the API key was not saved") from e
 
 
 def _decrypt_api_key(encrypted_key):
+    if not isinstance(encrypted_key, str):
+        raise ValueError("API key must be a string")
     if not encrypted_key:
         return encrypted_key
     if not encrypted_key.startswith("dpapi:"):
@@ -269,9 +282,70 @@ def migrate_legacy_files():
     _copy_legacy_file(get_legacy_user_games_path(), get_user_games_path())
 
 
-def _read_json_file(path):
-    with open(path, "r") as f:
-        return json.load(f)
+def _read_json_file(path, expected_type=None):
+    with _file_lock, open(path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if expected_type is not None and not isinstance(data, expected_type):
+        raise ValueError(f"Expected a JSON {expected_type.__name__}")
+    return data
+
+
+def _load_warning(path, error):
+    message = f"{os.path.basename(path)}: {error}"
+    with _file_lock:
+        _invalid_files.add(path)
+        if message not in LOAD_WARNINGS:
+            LOAD_WARNINGS.append(message)
+    logger.warning("Settings could not be fully loaded: %s", message)
+
+
+def _save_error(error):
+    global LAST_SAVE_ERROR
+    LAST_SAVE_ERROR = str(error)
+    logger.error("Settings were not saved: %s", error)
+    return False
+
+
+def _write_json_file(path, data):
+    """Replace only complete files; retain malformed originals before repair."""
+    global LAST_SAVE_ERROR
+    temporary = None
+    with _file_lock:
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                             prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False) as f:
+                temporary = f.name
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if path in _invalid_files and os.path.exists(path):
+                backup = path + ".invalid-" + uuid.uuid4().hex[:8]
+                shutil.copy2(path, backup)
+                logger.warning("Preserved malformed settings in %s", backup)
+            os.replace(temporary, path)
+            temporary = None
+            _invalid_files.discard(path)
+            LAST_SAVE_ERROR = ""
+            return True
+        except (OSError, ValueError, TypeError) as e:
+            return _save_error(e)
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    logger.warning("Could not remove temporary settings file %s", temporary)
+
+
+def valid_game_name(name):
+    return isinstance(name, str) and bool(re.fullmatch(r"[A-Za-z0-9 ._:\-]{1,64}", name))
+
+
+def normalize_executable_name(value):
+    if not isinstance(value, str):
+        return None
+    value = ntpath.basename(value.strip().strip('"'))
+    return value if re.fullmatch(r"[\w.\- ]+\.exe", value, re.IGNORECASE) else None
 
 
 def load_config():
@@ -285,21 +359,26 @@ def load_config():
 
     if os.path.exists(config_path):
         try:
-            saved = _read_json_file(config_path)
+            saved = _read_json_file(config_path, dict)
+            for field in ("router_ip", "api_key", "log_level"):
+                if field in saved and not isinstance(saved[field], str):
+                    _load_warning(config_path, f"{field} must be a string")
+                    saved[field] = DEFAULT_CONFIG[field]
+            for field in ("insecure_tls", "setup_complete", "local_tagging_enabled", "auto_start"):
+                if field in saved and not isinstance(saved[field], bool):
+                    _load_warning(config_path, f"{field} must be a boolean")
+                    saved[field] = DEFAULT_CONFIG[field]
             loaded_saved_config = True
             saved_has_local_tagging_mode = "local_tagging_mode" in saved
             saved_has_local_tagging_mode_migration = "local_tagging_mode_migration" in saved
-            legacy_https_without_tls_flag = (
-                "insecure_tls" not in saved and
-                str(saved.get("router_ip", "")).strip().startswith("https://")
-            )
             if "api_key" in saved:
-                saved["api_key"] = _decrypt_api_key(saved["api_key"])
+                encrypted_key = saved["api_key"]
+                saved["api_key"] = _decrypt_api_key(encrypted_key)
+                if encrypted_key.startswith("dpapi:") and not saved["api_key"]:
+                    _load_warning(config_path, "API key could not be decrypted; re-enter it in Settings")
             config.update(saved)
-            if legacy_https_without_tls_flag:
-                config["insecure_tls"] = True
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load config, using defaults: %s", e)
+        except (ValueError, UnicodeError, OSError) as e:
+            _load_warning(config_path, e)
 
     legacy_live_flow_mode = config.get("local_live_flow_policies")
     config["dscp_value"] = normalize_dscp_value(config.get("dscp_value"))
@@ -307,6 +386,11 @@ def load_config():
     if not saved_has_local_tagging_mode and legacy_live_flow_mode is not None:
         config["local_tagging_mode"] = normalize_local_tagging_mode(bool(legacy_live_flow_mode))
     config["local_tagging_mode"] = normalize_local_tagging_mode(config.get("local_tagging_mode"))
+    try:
+        config["heartbeat_interval"] = max(1, int(config.get("heartbeat_interval", 30)))
+    except (TypeError, ValueError, OverflowError):
+        _load_warning(config_path, "heartbeat_interval must be a number")
+        config["heartbeat_interval"] = 30
     if loaded_saved_config and not saved_has_local_tagging_mode_migration:
         if config["local_tagging_mode"] == LOCAL_TAGGING_MODE_LIVE_FLOWS:
             logger.info("Migrating local Windows DSCP tagging default to all-UDP mode")
@@ -317,25 +401,20 @@ def load_config():
 
 def save_config(config):
     """Save config to disk."""
-    config_path = get_config_path()
-    
-    config_to_save = dict(config)
-    config_to_save["dscp_value"] = normalize_dscp_value(config_to_save.get("dscp_value"))
-    config_to_save["local_tagging_enabled"] = bool(config_to_save.get("local_tagging_enabled", True))
-    config_to_save["local_tagging_mode"] = normalize_local_tagging_mode(config_to_save.get("local_tagging_mode"))
-    config_to_save["local_tagging_mode_migration"] = LOCAL_TAGGING_MODE_MIGRATION_VERSION
-    config_to_save.pop("local_live_flow_policies", None)
-    if "api_key" in config_to_save and config_to_save["api_key"]:
-        config_to_save["api_key"] = _encrypt_api_key(config_to_save["api_key"])
-        
     try:
-        with open(config_path, "w") as f:
-            json.dump(config_to_save, f, indent=2)
-        logger.info("Config saved to %s", config_path)
-        return True
-    except OSError as e:
-        logger.error("Failed to save config: %s", e)
-        return False
+        config_to_save = dict(config)
+        config_to_save["dscp_value"] = normalize_dscp_value(config_to_save.get("dscp_value"))
+        config_to_save["local_tagging_enabled"] = bool(config_to_save.get("local_tagging_enabled", True))
+        config_to_save["local_tagging_mode"] = normalize_local_tagging_mode(config_to_save.get("local_tagging_mode"))
+        config_to_save["local_tagging_mode_migration"] = LOCAL_TAGGING_MODE_MIGRATION_VERSION
+        config_to_save.pop("local_live_flow_policies", None)
+        if not isinstance(config_to_save.get("api_key", ""), str):
+            raise ValueError("API key must be a string")
+        if config_to_save.get("api_key"):
+            config_to_save["api_key"] = _encrypt_api_key(config_to_save["api_key"])
+        return _write_json_file(get_config_path(), config_to_save)
+    except (OSError, ValueError, TypeError) as e:
+        return _save_error(e)
 
 
 def load_user_games():
@@ -345,9 +424,13 @@ def load_user_games():
 
     if os.path.exists(path):
         try:
-            return sanitize_user_games(_read_json_file(path))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load user games: %s", e)
+            games = _read_json_file(path, list)
+            sanitized = sanitize_user_games(games)
+            if len(games) != len(sanitized):
+                _load_warning(path, "Invalid custom game entries were skipped")
+            return sanitized
+        except (ValueError, UnicodeError, OSError) as e:
+            _load_warning(path, e)
     return []
 
 
@@ -363,6 +446,11 @@ def sanitize_user_games(games):
         executables = game.get("executables", [])
         if isinstance(executables, str):
             executables = [item.strip() for item in executables.split(",") if item.strip()]
+        if not isinstance(executables, list) or not executables:
+            continue
+        executables = [normalize_executable_name(item) for item in executables]
+        if not all(executables) or not valid_game_name(game.get("name")):
+            continue
         entry = {
             "id": game_id(game, "custom"),
             "name": game.get("name", "Custom"),
@@ -401,38 +489,31 @@ def load_game_rules():
     path = get_game_rules_path()
     if os.path.exists(path):
         try:
-            return sanitize_game_rules(_read_json_file(path))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load game rules: %s", e)
+            return sanitize_game_rules(_read_json_file(path, dict))
+        except (ValueError, UnicodeError, OSError) as e:
+            _load_warning(path, e)
     return {}
 
 
 def save_game_rules(rules):
     """Save per-game local tagging rule overrides."""
-    path = get_game_rules_path()
-    sanitized = sanitize_game_rules(rules)
     try:
-        with open(path, "w") as f:
-            json.dump(sanitized, f, indent=2)
-        logger.info("Game rules saved (%d overrides)", len(sanitized))
-        return True
-    except OSError as e:
-        logger.error("Failed to save game rules: %s", e)
-        return False
+        if not isinstance(rules, dict):
+            raise ValueError("Game rules must be an object")
+        return _write_json_file(get_game_rules_path(), sanitize_game_rules(rules))
+    except (OSError, ValueError, TypeError) as e:
+        return _save_error(e)
 
 
 def save_user_games(games):
     """Save user's custom game list."""
-    path = get_user_games_path()
-    sanitized = sanitize_user_games(games)
     try:
-        with open(path, "w") as f:
-            json.dump(sanitized, f, indent=2)
-        logger.info("User games saved (%d entries)", len(sanitized))
-        return True
-    except OSError as e:
-        logger.error("Failed to save user games: %s", e)
-        return False
+        sanitized = sanitize_user_games(games)
+        if not isinstance(games, list) or len(sanitized) != len(games):
+            raise ValueError("Custom games contain invalid names or executables")
+        return _write_json_file(get_user_games_path(), sanitized)
+    except (OSError, ValueError, TypeError) as e:
+        return _save_error(e)
 
 
 def is_configured(config):

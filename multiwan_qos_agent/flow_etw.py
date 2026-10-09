@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from ctypes import wintypes
 
 try:
@@ -27,8 +28,8 @@ logger = logging.getLogger("multiwan_qos_agent.flow_etw")
 WINDOW_SECONDS = 45
 MIN_FLOW_AGE = 3
 STALE_SECONDS = 15
-MIN_BYTES_PER_SECOND = 4094
-TOP_FLOW_RATIO = 0.50
+MIN_BYTES_PER_SECOND = 0
+TOP_FLOW_RATIO = 0
 MAX_SELECTED_FLOWS = 3
 
 IGNORED_UDP_PORTS = {
@@ -531,7 +532,7 @@ class UdpOwnerMap:
 
 
 class EtwFlowCollector:
-    """Collects recent UDP flow telemetry and selects highest-throughput flows."""
+    """Collect recent UDP telemetry and select flows by recent packet activity."""
 
     def __init__(self, window_seconds=WINDOW_SECONDS):
         self.window_seconds = window_seconds
@@ -539,6 +540,11 @@ class EtwFlowCollector:
         self.activity_event = threading.Event()
         self.tracked_pids = set()
         self.flows = {}
+        self.endpoint_keys = {}
+        self.next_prune_at = 0
+        self.next_start_at = 0
+        self.retry_delay = 5
+        self.started_at = 0
         self.running = False
         self.available = False
         self.status_message = "ETW flow telemetry not started"
@@ -567,12 +573,13 @@ class EtwFlowCollector:
             self._start_session()
             self._open_consumer()
             self.running = True
+            self.available = True
+            self.started_at = time.monotonic()
+            self.status_message = "ETW flow telemetry active"
             self.thread = threading.Thread(target=self._process, name="MultiWANQoSETW", daemon=True)
             self.thread.start()
-            self.available = True
-            self.status_message = "ETW flow telemetry active"
             logger.info(self.status_message)
-            return True
+            return self.available
         except OSError as exc:
             code = exc.errno if isinstance(exc.errno, int) else ctypes.get_last_error()
             if code == 5:
@@ -589,10 +596,29 @@ class EtwFlowCollector:
             self.stop()
             return False
 
+    def ensure_running(self):
+        """Retry failed telemetry without restarting the application."""
+        now = time.monotonic()
+        if self.available:
+            if now - self.started_at >= 60:
+                self.retry_delay = 5
+            return True
+        if now < self.next_start_at:
+            return False
+        if not self.stop():
+            self.next_start_at = now + self.retry_delay
+            return False
+        if self.start():
+            return True
+        self.next_start_at = now + self.retry_delay
+        self.retry_delay = min(60, self.retry_delay * 2)
+        return False
+
     def stop(self):
         self.running = False
+        self.available = False
         try:
-            if self.advapi and self.consumer_handle:
+            if self.advapi and self.consumer_handle not in (None, INVALID_PROCESSTRACE_HANDLE):
                 self.advapi.CloseTrace(self.consumer_handle)
         except Exception:
             logger.debug("CloseTrace failed", exc_info=True)
@@ -606,7 +632,17 @@ class EtwFlowCollector:
                 )
         except Exception:
             logger.debug("ControlTrace stop failed", exc_info=True)
-        self.available = False
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                logger.warning("ETW consumer is still stopping; delaying restart")
+                return False
+        self.consumer_handle = None
+        self.session_handle = None
+        with self.lock:
+            self.flows.clear()
+            self.endpoint_keys.clear()
+        return True
 
     def status(self):
         return {
@@ -622,9 +658,13 @@ class EtwFlowCollector:
         return True
 
     def set_tracked_pids(self, pids):
-        """Limit monitor wakeups to flows owned by currently detected games."""
+        """Keep telemetry and wakeups limited to detected game processes."""
         with self.lock:
             self.tracked_pids = {int(pid) for pid in pids}
+            for key in list(self.flows):
+                if key[0] not in self.tracked_pids:
+                    del self.flows[key]
+                    self.endpoint_keys.pop(key[:3], None)
 
     def _start_session(self):
         self.props_buffer, self.props = _new_properties()
@@ -672,10 +712,18 @@ class EtwFlowCollector:
             raise OSError(ctypes.get_last_error(), "OpenTraceW failed")
 
     def _process(self):
-        handle = self.trace_handle_type(self.consumer_handle)
-        status = self.advapi.ProcessTrace(ctypes.byref(handle), 1, None, None)
-        if self.running and status != ERROR_SUCCESS:
-            self.status_message = f"ETW flow telemetry stopped ({status})"
+        try:
+            handle = self.trace_handle_type(self.consumer_handle)
+            status = self.advapi.ProcessTrace(ctypes.byref(handle), 1, None, None)
+        except Exception:
+            status = "consumer error"
+            logger.exception("ETW consumer failed")
+        if self.running:
+            self.available = False
+            self.running = False
+            self.status_message = f"ETW flow telemetry stopped ({status}); retrying"
+            self.next_start_at = time.monotonic() + self.retry_delay
+            self.retry_delay = min(60, self.retry_delay * 2)
             logger.warning("ETW ProcessTrace exited with status %s", status)
 
     def _property_raw(self, event_record, *names):
@@ -713,6 +761,8 @@ class EtwFlowCollector:
 
     def _on_event(self, event_record):
         try:
+            if not self.running or not self.tracked_pids:
+                return
             header = event_record.contents.EventHeader
             event_id = int(header.EventDescriptor.Id)
             if event_id not in UDP_EVENT_IDS:
@@ -721,6 +771,8 @@ class EtwFlowCollector:
             pid = _bytes_to_int(
                 self._property_raw(event_record, "PID", "ProcessId", "ProcessID") or b""
             )
+            if pid and pid not in self.tracked_pids:
+                return
             size = _bytes_to_int(
                 self._property_raw(event_record, "size", "Size", "TransferSize") or b""
             )
@@ -747,6 +799,8 @@ class EtwFlowCollector:
             logger.debug("Failed to process ETW UDP event", exc_info=True)
 
     def record(self, pid, event_id, size, saddr, sport, daddr, dport):
+        if not self.tracked_pids:
+            return
         now = time.monotonic()
         remote_ip = None
         remote_port = None
@@ -795,27 +849,20 @@ class EtwFlowCollector:
             return
 
         owner_pids = self.owner_map.pids_for_port(local_port) if local_port else set()
-        candidate_pids = {int(pid)} if pid else set()
-        candidate_pids.update(owner_pids)
+        candidate_pids = ({candidate_pid} if candidate_pid in self.tracked_pids
+                          else owner_pids & self.tracked_pids)
         if not candidate_pids:
             return
 
         with self.lock:
-            tracked_pids = set(self.tracked_pids)
-            for candidate_pid in candidate_pids:
+            for candidate_pid in candidate_pids & self.tracked_pids:
                 local_port_id = int(local_port or 0)
                 key = (candidate_pid, remote_ip, int(remote_port), local_port_id)
                 if local_port_id:
-                    stale_keys = [
-                        old_key for old_key in self.flows
-                        if len(old_key) == 4
-                        and old_key[0] == candidate_pid
-                        and old_key[1] == remote_ip
-                        and old_key[2] == int(remote_port)
-                        and old_key[3] != local_port_id
-                    ]
-                    for old_key in stale_keys:
-                        del self.flows[old_key]
+                    previous_key = self.endpoint_keys.get(key[:3])
+                    if previous_key != key:
+                        self.flows.pop(previous_key, None)
+                    self.endpoint_keys[key[:3]] = key
                 flow = self.flows.get(key)
                 if not flow:
                     flow = {
@@ -827,16 +874,28 @@ class EtwFlowCollector:
                         "packets": 0,
                         "first_seen": now,
                         "last_seen": now,
+                        "samples": deque(),
                     }
                     self.flows[key] = flow
-                    if candidate_pid in tracked_pids:
-                        self.activity_event.set()
+                    self.activity_event.set()
                 flow["bytes"] += int(size)
                 flow["packets"] += 1
                 flow["last_seen"] = now
+                bucket = int(now)
+                samples = flow["samples"]
+                if samples and samples[-1][0] == bucket:
+                    samples[-1][1] += int(size)
+                    samples[-1][2] += 1
+                else:
+                    samples.append([bucket, int(size), 1])
+                while samples and samples[0][0] < now - self.window_seconds:
+                    samples.popleft()
             self._prune_locked(now)
 
     def _prune_locked(self, now):
+        if now < self.next_prune_at:
+            return
+        self.next_prune_at = now + 1
         cutoff = now - self.window_seconds
         stale = [
             key
@@ -845,6 +904,8 @@ class EtwFlowCollector:
         ]
         for key in stale:
             del self.flows[key]
+            if self.endpoint_keys.get(key[:3]) == key:
+                del self.endpoint_keys[key[:3]]
 
     def select_for_pids(
         self,
@@ -863,25 +924,29 @@ class EtwFlowCollector:
         with self.lock:
             self._prune_locked(now)
             candidates = [
-                dict(flow)
+                {**flow, "samples": [tuple(sample) for sample in flow["samples"]]}
                 for flow in self.flows.values()
                 if flow["pid"] in pid_set
             ]
 
         ranked = []
         for flow in candidates:
-            age = max(flow["last_seen"] - flow["first_seen"], 0.001)
+            age = max(now - flow["first_seen"], 0.001)
             idle = now - flow["last_seen"]
-            bps = flow["bytes"] / age
+            samples = [sample for sample in flow.pop("samples") if sample[0] >= now - self.window_seconds]
+            span = max(1, min(age, self.window_seconds))
+            bps = sum(sample[1] for sample in samples) / span
+            packets = sum(sample[2] for sample in samples)
             flow["bytes_per_sec"] = bps
+            flow["packets_per_sec"] = packets / span
             flow["age"] = age
             flow["idle"] = idle
 
-            if age < min_age:
-                flow["ignored_reason"] = "warming up"
-                ignored.append(flow)
-            elif idle > stale_seconds:
+            if idle > stale_seconds:
                 flow["ignored_reason"] = "stale"
+                ignored.append(flow)
+            elif age < min_age or packets < 3:
+                flow["ignored_reason"] = "warming up"
                 ignored.append(flow)
             elif bps < min_bps:
                 flow["ignored_reason"] = "low throughput"
@@ -889,7 +954,7 @@ class EtwFlowCollector:
             else:
                 ranked.append(flow)
 
-        ranked.sort(key=lambda item: item["bytes_per_sec"], reverse=True)
+        ranked.sort(key=lambda item: (item["packets_per_sec"], item["bytes_per_sec"]), reverse=True)
         if not ranked:
             return [], ignored
 
@@ -899,7 +964,7 @@ class EtwFlowCollector:
                 flow["ignored_reason"] = "over cap"
                 ignored.append(flow)
                 continue
-            if selected and flow["bytes_per_sec"] < (top_bps * top_ratio):
+            if top_ratio and selected and flow["bytes_per_sec"] < (top_bps * top_ratio):
                 flow["ignored_reason"] = "below top flow ratio"
                 ignored.append(flow)
                 continue

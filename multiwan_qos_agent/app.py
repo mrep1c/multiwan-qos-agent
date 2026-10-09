@@ -37,6 +37,7 @@ TASK_NAME = "MultiWAN QoS Agent"
 SINGLE_INSTANCE_MUTEX = "Local\\MultiWANQoSAgentSingleInstance"
 ERROR_ALREADY_EXISTS = 183
 ROUTER_RULE_REASSERT_SECONDS = 60
+WINDOWS_POLICY_RECHECK_SECONDS = 60
 IDLE_DETECTION_INTERVAL_SECONDS = 2
 ACTIVE_GAME_STEADY_INTERVAL_SECONDS = 5
 ACTIVE_GAME_HEARTBEAT_INTERVAL_SECONDS = 5
@@ -53,6 +54,7 @@ class AgentState:
     """Shared state between background thread and UI."""
     def __init__(self):
         self.lock = threading.Lock()
+        self.mutation_lock = threading.Lock()
         self.active_games = {}        # {game_name: {pids, exe_name, ...}}
         self.live_connections = []     # Current connection report sent to router
         self.flow_candidates = []      # ETW flows shown in dashboard but not necessarily sent
@@ -66,9 +68,22 @@ class AgentState:
         self.game_db = monitor.load_game_database()
         self.user_games = cfg.load_user_games()
         self.game_rules = cfg.load_game_rules()
+        self.startup_warnings = list(cfg.LOAD_WARNINGS)
+        self.router_target = None
         self.settings_open = False
         self.shutdown_cleanup_done = False
         self.sync_requested = False
+
+    def save_config(self, changes):
+        """Commit settings and in-memory state together, without stale snapshots."""
+        with self.lock:
+            candidate = {**self.config, **changes}
+            if not cfg.save_config(candidate):
+                return False
+            self.config = candidate
+            self.sync_requested = True
+            self.last_sync_msg = "Settings changed; syncing"
+            return True
 
     def get_snapshot(self):
         with self.lock:
@@ -144,9 +159,15 @@ def _build_policy_specs(
             if not remote_ip or not remote_port:
                 continue
 
+            exe_name = game_data.get("pid_exes", {}).get(conn.get("pid"))
+            if not exe_name:
+                exe_names = game_data.get("exe_names", [game_data["exe_name"]])
+                if len(exe_names) != 1:
+                    continue
+                exe_name = exe_names[0]
             specs.extend(qos.build_policy_specs(
                 game_name,
-                game_data["exe_name"],
+                exe_name,
                 None,
                 remote_ip=remote_ip,
                 remote_port=remote_port,
@@ -158,7 +179,8 @@ def _build_policy_specs(
     for game_name, game_data in detected.items():
         if not _game_allows_local_tagging(game_data, game_rules, local_tagging_enabled):
             continue
-        specs.extend(qos.build_policy_specs(game_name, game_data["exe_name"], None))
+        for exe_name in game_data.get("exe_names", [game_data["exe_name"]]):
+            specs.extend(qos.build_policy_specs(game_name, exe_name, None))
 
     return specs
 
@@ -319,9 +341,12 @@ def _release_single_instance_mutex():
     _single_instance_handle = None
 
 
-def _sync_windows_policies(desired_specs, dscp_value, reason):
+def _sync_windows_policies(state, desired_specs, dscp_value, reason):
     try:
-        ok = qos.sync_qos_policies(desired_specs, dscp_value)
+        with state.mutation_lock:
+            if not state.running:
+                return False
+            ok = qos.sync_qos_policies(desired_specs, dscp_value)
         if ok:
             logger.info(
                 "Windows QoS policy sync OK (%s): desired=%d",
@@ -348,15 +373,25 @@ def _cleanup_windows_policies(reason):
         return result
     except Exception:
         logger.exception("Windows QoS cleanup failed (%s)", reason)
-        return {"removed": 0, "remaining": [], "failed": []}
+        return {"removed": 0, "remaining": ["unknown"], "failed": ["cleanup failed"]}
 
 
-def _cleanup_router_rules(config, reason, disconnect=False):
+def _sync_router(state, method, *args, **kwargs):
+    """Shutdown and normal requests share one mutation boundary."""
+    with state.mutation_lock:
+        if not state.running:
+            return sync.SyncResult(False, "Agent is stopping")
+        with state.lock:
+            state.router_target = (*args[:3], bool(kwargs.get("insecure_tls", False)))
+        return method(*args, **kwargs)
+
+
+def _cleanup_router_rules(config, reason, disconnect=False, pc_ip=None):
     if not cfg.is_configured(config):
         logger.debug("Router cleanup skipped (%s): agent is not configured", reason)
         return False, "agent is not configured"
 
-    pc_ip = monitor.get_local_ip(config.get("router_ip"))
+    pc_ip = pc_ip or monitor.get_local_ip(config.get("router_ip"))
     if not pc_ip:
         logger.warning("Router cleanup skipped (%s): could not determine PC IP", reason)
         return False, "could not determine PC IP"
@@ -394,8 +429,15 @@ def _shutdown_cleanup(state, reason):
         state.running = False
         current_config = dict(state.config)
 
-    _cleanup_windows_policies(reason)
-    ok, _msg = _cleanup_router_rules(current_config, reason, disconnect=True)
+    with state.mutation_lock:
+        with state.lock:
+            target = state.router_target
+        pc_ip = None
+        if target:
+            current_config.update(router_ip=target[0], api_key=target[1], insecure_tls=target[3], setup_complete=True)
+            pc_ip = target[2]
+        _cleanup_windows_policies(reason)
+        ok, _msg = _cleanup_router_rules(current_config, reason, disconnect=True, pc_ip=pc_ip)
 
     if ok:
         with state.lock:
@@ -409,6 +451,8 @@ def monitor_loop(state):
     last_router_game_names = set()
     last_router_update_time = 0
     last_policy_signature = None
+    last_policy_check_at = 0
+    last_router_target = None
     router_clear_pending = False
     fast_recovery_until = 0
     last_router_flow_packet_time = None
@@ -419,7 +463,7 @@ def monitor_loop(state):
     exe_map = monitor.get_all_game_executables(state.game_db, state.user_games)
     interval = state.config.get("heartbeat_interval", 30)
     flow_collector = flow_etw.EtwFlowCollector()
-    flow_collector.start()
+    flow_collector.ensure_running()
     with state.lock:
         state.flow_status = flow_collector.status()
 
@@ -441,7 +485,7 @@ def monitor_loop(state):
 
             try:
                 interval = max(1, int(current_config.get("heartbeat_interval", 30)))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 interval = 30
             dscp_value = cfg.normalize_dscp_value(current_config.get("dscp_value"))
             local_tagging_enabled = bool(current_config.get("local_tagging_enabled", True))
@@ -476,6 +520,7 @@ def monitor_loop(state):
                 for game_data in detected.values()
                 for pid in game_data.get("pids", [])
             )
+            flow_collector.ensure_running()
             if detected:
                 connections, flow_candidates = monitor.build_connection_report(
                     detected,
@@ -528,17 +573,38 @@ def monitor_loop(state):
                 game_rules,
             )
             desired_signature = _policy_signature(desired_specs, dscp_value)
-            if transitioned_to_idle or desired_signature != last_policy_signature:
+            if (transitioned_to_idle or desired_signature != last_policy_signature
+                    or time.monotonic() - last_policy_check_at >= WINDOWS_POLICY_RECHECK_SECONDS):
                 policy_reason = "game stop" if transitioned_to_idle else (
                     ("live-flow update" if local_tagging_mode == cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS else "game update")
                     if desired_specs else
                     ("local-tagging cleanup" if detected else "startup cleanup")
                 )
-                if _sync_windows_policies(desired_specs, dscp_value, policy_reason):
+                if _sync_windows_policies(state, desired_specs, dscp_value, policy_reason):
                     last_policy_signature = desired_signature
+                    last_policy_check_at = time.monotonic()
+
+            if not state.running:
+                break
 
             # Sync to router
             pc_ip = monitor.get_local_ip(current_config.get("router_ip"))
+            if pc_ip:
+                target = (current_config["router_ip"], current_config["api_key"], pc_ip, insecure_tls)
+                if target != last_router_target:
+                    if last_router_target and (target[0], target[2]) != (last_router_target[0], last_router_target[2]):
+                        old_result = _sync_router(state, sync.send_clear, *last_router_target[:3],
+                                                  insecure_tls=last_router_target[3])
+                        if not old_result.ok:
+                            logger.warning("Could not clear previous router destination: %s", old_result.message)
+                    last_router_target = target
+                    last_conns_json = None
+                    last_router_game_names.clear()
+                    last_router_update_time = 0
+                    next_heartbeat_at = 0
+                    fast_recovery_until = 0
+                    router_clear_pending = False
+                    no_flow_clear_sent = False
             if pc_ip and detected:
                 now = time.monotonic()
                 heartbeat_interval = min(interval, ACTIVE_GAME_HEARTBEAT_INTERVAL_SECONDS)
@@ -570,7 +636,7 @@ def monitor_loop(state):
                     )
 
                     if should_clear_no_flow or router_clear_pending:
-                        sync_result = sync.send_clear(
+                        sync_result = _sync_router(state, sync.send_clear,
                             current_config["router_ip"], current_config["api_key"], pc_ip,
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
@@ -593,7 +659,7 @@ def monitor_loop(state):
                             last_router_flow_packet_time = None
                     elif heartbeat_due:
                         preserve_router_rules = last_conns_json is not None
-                        sync_result = sync.send_heartbeat(
+                        sync_result = _sync_router(state, sync.send_heartbeat,
                             current_config["router_ip"], current_config["api_key"], pc_ip,
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
@@ -620,12 +686,25 @@ def monitor_loop(state):
                     )
                     if fast_recovery_active:
                         next_sleep = ROUTER_FAST_RECOVERY_INTERVAL_SECONDS
-                    if conns_json != last_conns_json or should_reassert or fast_recovery_active:
+                    if router_clear_pending:
+                        sync_result = _sync_router(state, sync.send_clear,
+                            current_config["router_ip"], current_config["api_key"], pc_ip,
+                            insecure_tls=insecure_tls)
+                        ok, msg = sync_result
+                        router_contacted = True
+                        next_heartbeat_at = _next_heartbeat_deadline(heartbeat_interval, ok)
+                        next_sleep = ROUTER_FAST_RECOVERY_INTERVAL_SECONDS
+                        if ok:
+                            router_clear_pending = False
+                            last_conns_json = None
+                            last_router_game_names.clear()
+                            last_router_update_time = 0
+                    elif conns_json != last_conns_json or should_reassert or fast_recovery_active:
                         if should_reassert and conns_json == last_conns_json:
                             logger.info("Reasserting router agent rules")
                         elif fast_recovery_active and conns_json == last_conns_json:
                             logger.info("Fast recovery: retrying router agent update")
-                        sync_result = sync.send_update(
+                        sync_result = _sync_router(state, sync.send_update,
                             current_config["router_ip"], current_config["api_key"],
                             pc_ip, router_connections, dscp_value,
                             insecure_tls=insecure_tls,
@@ -673,7 +752,7 @@ def monitor_loop(state):
                         elif _message_needs_router_clear(msg):
                             router_clear_pending = True
                     elif heartbeat_due:
-                        sync_result = sync.send_heartbeat(
+                        sync_result = _sync_router(state, sync.send_heartbeat,
                             current_config["router_ip"], current_config["api_key"], pc_ip,
                             insecure_tls=insecure_tls)
                         ok, msg = sync_result
@@ -722,7 +801,7 @@ def monitor_loop(state):
                     last_conns_json = None
 
                 if router_clear_pending:
-                    ok, msg = sync.send_clear(
+                    ok, msg = _sync_router(state, sync.send_clear,
                         current_config["router_ip"], current_config["api_key"], pc_ip,
                         insecure_tls=insecure_tls)
                     router_contacted = True
@@ -737,7 +816,7 @@ def monitor_loop(state):
                         last_router_game_names.clear()
                         last_router_update_time = 0
                 elif time.monotonic() >= next_heartbeat_at:
-                    ok, msg = sync.send_heartbeat(
+                    ok, msg = _sync_router(state, sync.send_heartbeat,
                         current_config["router_ip"], current_config["api_key"], pc_ip,
                         insecure_tls=insecure_tls)
                     router_contacted = True
@@ -844,10 +923,12 @@ def show_custom_games(state, parent):
 
         def set_games(games):
             with state.lock:
+                if not cfg.save_user_games(games):
+                    return False
                 state.user_games = games
                 state.sync_requested = True
                 state.last_sync_msg = "Game list changed; syncing"
-            cfg.save_user_games(games)
+            return True
 
         def get_rules():
             with state.lock:
@@ -856,10 +937,12 @@ def show_custom_games(state, parent):
         def set_rules(rules):
             sanitized = cfg.sanitize_game_rules(rules)
             with state.lock:
+                if not cfg.save_game_rules(sanitized):
+                    return False
                 state.game_rules = sanitized
                 state.sync_requested = True
                 state.last_sync_msg = "Game rules changed; syncing"
-            cfg.save_game_rules(sanitized)
+            return True
 
         def game_entries():
             entries = []
@@ -941,15 +1024,20 @@ def show_custom_games(state, parent):
 
             if not name:
                 return None, "Name is required"
+            if not cfg.valid_game_name(name):
+                return None, "Name: use 1–64 letters, numbers, spaces, hyphens, underscores, colons or dots"
             if not executables:
                 return None, "At least one executable is required"
-            for exe in executables:
-                if not exe.lower().endswith(".exe"):
-                    return None, f"Executable must end with .exe: {exe}"
+            normalized_executables = [cfg.normalize_executable_name(exe) for exe in executables]
+            if not all(normalized_executables):
+                return None, "Enter valid .exe names or Windows executable paths"
+            for other in game_entries():
+                if other["id"] != existing_id and other["game"]["name"].casefold() == name.casefold():
+                    return None, "A game with this name already exists"
 
             entry = {
                 "name": name,
-                "executables": executables,
+                "executables": list(dict.fromkeys(normalized_executables)),
                 "proto": "udp",
             }
             if existing_id:
@@ -965,13 +1053,15 @@ def show_custom_games(state, parent):
                 rules.pop(game_key, None)
             else:
                 rules[game_key] = {"local_tagging": rule}
-            set_rules(rules)
+            return set_rules(rules)
 
         def save_entry():
             current = entries_state.get("selected")
 
             if current and current["source"] == "builtin":
-                save_rule(current["id"])
+                if not save_rule(current["id"]):
+                    status_var.set(f"Not saved: {cfg.LAST_SAVE_ERROR}")
+                    return
                 refresh_list(current["id"])
                 status_var.set("Saved")
                 return
@@ -988,10 +1078,12 @@ def show_custom_games(state, parent):
             else:
                 games.append(entry)
 
-            set_games(games)
-            save_rule(entry["id"])
+            if not set_games(games):
+                status_var.set(f"Not saved: {cfg.LAST_SAVE_ERROR}")
+                return
+            rule_saved = save_rule(entry["id"])
             refresh_list(entry["id"])
-            status_var.set("Saved")
+            status_var.set("Saved" if rule_saved else f"Game saved; override not saved: {cfg.LAST_SAVE_ERROR}")
 
         def new_entry():
             game_list.selection_clear(0, tk.END)
@@ -1010,14 +1102,16 @@ def show_custom_games(state, parent):
                 return
             games = get_games()
             del games[current["index"]]
-            set_games(games)
+            if not set_games(games):
+                status_var.set(f"Not deleted: {cfg.LAST_SAVE_ERROR}")
+                return
             rules = get_rules()
             if current["id"]:
                 rules.pop(current["id"], None)
-            set_rules(rules)
+            rules_saved = set_rules(rules)
             new_entry()
             refresh_list()
-            status_var.set("Deleted")
+            status_var.set("Deleted" if rules_saved else f"Game deleted; override cleanup failed: {cfg.LAST_SAVE_ERROR}")
 
         buttons = ttk.Frame(right)
         buttons.pack(fill="x", pady=(12, 0))
@@ -1078,17 +1172,10 @@ class DashboardWindow:
             current_value = cfg.normalize_dscp_value(self.state.config.get("dscp_value"))
             if new_value == current_value:
                 return
-            new_config = dict(self.state.config)
-            new_config["dscp_value"] = new_value
-            self.state.config = new_config
-            self.state.last_sync_msg = "DSCP changed; syncing"
-            self.state.sync_requested = True
-
-        if cfg.save_config(new_config):
-            with self.state.lock:
-                self.state.config = cfg.load_config()
-        else:
+        if not self.state.save_config({"dscp_value": new_value}):
+            self.dscp_var.set(cfg.dscp_label(current_value))
             logger.error("Failed to save DSCP selection")
+            messagebox.showerror("MultiWAN QoS Agent", cfg.LAST_SAVE_ERROR, parent=self.root)
 
     def _refresh_dscp_selection(self, dscp_value):
         if not self.dscp_var:
@@ -1257,7 +1344,8 @@ class DashboardWindow:
                 mode = "psutil live"
             else:
                 mode = "waiting for live UDP"
-            self.game_tree.insert("", "end", values=(name, f"{data.get('exe_name', '?')} ({pids})", mode))
+            executables = ", ".join(data.get("exe_names", [data.get("exe_name", "?")]))
+            self.game_tree.insert("", "end", values=(name, f"{executables} ({pids})", mode))
 
         # Connections table
         self.conn_tree.delete(*self.conn_tree.get_children())
@@ -1294,13 +1382,10 @@ def show_settings(state, parent):
         return
     state.settings_open = True
 
-    def _router_uses_https(value):
-        return str(value or "").strip().lower().startswith("https://")
-
     def _run():
         root = tk.Toplevel(parent)
         root.title("MultiWAN QoS Agent — Settings")
-        root.geometry("460x430")
+        root.geometry("460x470")
         root.resizable(False, False)
         root.update_idletasks()
         root.tk.call("tk::PlaceWindow", root._w, "center")
@@ -1333,27 +1418,13 @@ def show_settings(state, parent):
                          ).pack(anchor="w")
 
         tls_var = tk.BooleanVar(master=root, value=bool(state.config.get("insecure_tls", False)))
-        tls_manual = {
-            "value": (
-                _router_uses_https(ip_var.get()) and
-                not bool(state.config.get("insecure_tls", False))
-            )
-        }
-
-        def mark_tls_manual():
-            tls_manual["value"] = True
-
-        def auto_enable_tls_for_https(*_args):
-            if _router_uses_https(ip_var.get()) and not tls_manual["value"]:
-                tls_var.set(True)
-
-        ip_var.trace_add("write", auto_enable_tls_for_https)
         ttk.Checkbutton(
             frame,
             text="Allow insecure HTTPS certificates",
             variable=tls_var,
-            command=mark_tls_manual,
         ).pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame, text="Enable only for a trusted router's self-signed certificate. "
+                  "The router's identity will not be verified.", wraplength=410).pack(anchor="w")
 
         tagging_enabled_var = tk.BooleanVar(
             master=root,
@@ -1412,7 +1483,6 @@ def show_settings(state, parent):
             status_lbl.config(foreground="green" if ok else "red")
 
         def on_save():
-            new_config = dict(state.config)
             router_ip = ip_entry.get().strip()
             api_key = key_entry.get().strip()
             auto_start = auto_var.get()
@@ -1421,26 +1491,21 @@ def show_settings(state, parent):
                 messagebox.showerror("MultiWAN QoS Agent", "Router IP and API key are required.", parent=root)
                 return
 
+            previous_auto_start = is_autostart_enabled()
             if not setup_autostart(auto_start):
                 messagebox.showerror("MultiWAN QoS Agent", "Failed to update Start with Windows. Check the agent log.", parent=root)
                 return
 
-            new_config["router_ip"] = router_ip
-            new_config["api_key"] = api_key
-            new_config["insecure_tls"] = bool(tls_var.get())
-            new_config["local_tagging_enabled"] = bool(tagging_enabled_var.get())
-            new_config["local_tagging_mode"] = cfg.local_tagging_mode_from_label(mode_var.get())
-            new_config["auto_start"] = auto_start
-            new_config["setup_complete"] = True
-
-            if not cfg.save_config(new_config):
-                messagebox.showerror("MultiWAN QoS Agent", "Failed to save settings. Check file permissions.", parent=root)
+            changes = {"router_ip": router_ip, "api_key": api_key, "insecure_tls": bool(tls_var.get()),
+                       "local_tagging_enabled": bool(tagging_enabled_var.get()),
+                       "local_tagging_mode": cfg.local_tagging_mode_from_label(mode_var.get()),
+                       "auto_start": auto_start, "setup_complete": True}
+            if not state.save_config(changes):
+                error = cfg.LAST_SAVE_ERROR
+                if auto_start != previous_auto_start and not setup_autostart(previous_auto_start):
+                    error += ". Start with Windows could not be restored; check Task Scheduler."
+                messagebox.showerror("MultiWAN QoS Agent", error, parent=root)
                 return
-
-            with state.lock:
-                state.config = cfg.load_config()
-                state.sync_requested = True
-                state.last_sync_msg = "Settings changed; syncing"
 
             status_var.set(f"Saved to {cfg.get_config_path()}")
             messagebox.showinfo("MultiWAN QoS Agent", "Settings saved!", parent=root)
@@ -1640,15 +1705,12 @@ def sync_autostart_config(state):
     with state.lock:
         if state.config.get("auto_start") == actual:
             return actual
-        new_config = dict(state.config)
-        new_config["auto_start"] = actual
-        state.config = new_config
-
-    if cfg.save_config(new_config):
-        with state.lock:
-            state.config = cfg.load_config()
-    else:
+        if state.startup_warnings:
+            state.config["auto_start"] = actual
+            return actual
+    if not state.save_config({"auto_start": actual}):
         logger.error("Failed to save auto-start sync state")
+        state.startup_warnings.append(cfg.LAST_SAVE_ERROR)
 
     return actual
 
@@ -1697,6 +1759,10 @@ def main():
     state = AgentState()
     sync_autostart_config(state)
     ui = UIManager(state)
+    if state.startup_warnings:
+        ui.root.after(0, lambda: messagebox.showwarning("MultiWAN QoS Agent",
+            "Some settings could not be loaded. Invalid files are preserved and backed up when repaired.\n\n"
+            + "\n".join(state.startup_warnings), parent=ui.root))
     start_in_tray = should_start_in_tray()
 
     # First/manual launch should show a real window. Scheduled autostart uses --tray.
@@ -1747,20 +1813,17 @@ def main():
         ui.call("quit", ui.quit)
 
     def on_autostart(icon, item):
-        desired = not is_autostart_enabled()
+        previous = is_autostart_enabled()
+        desired = not previous
         if not setup_autostart(desired):
             return
 
-        with state.lock:
-            new_config = dict(state.config)
-            new_config["auto_start"] = desired
-            state.config = new_config
-
-        if cfg.save_config(new_config):
-            with state.lock:
-                state.config = cfg.load_config()
-        else:
+        if not state.save_config({"auto_start": desired}):
             logger.error("Failed to save auto-start setting")
+            error = cfg.LAST_SAVE_ERROR
+            if not setup_autostart(previous):
+                error += ". Start with Windows could not be restored; check Task Scheduler."
+            ui.call("save error", lambda: ui.show_error(error))
 
         try:
             icon.update_menu()
