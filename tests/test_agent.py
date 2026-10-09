@@ -192,6 +192,31 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(query.call_count, 1)
             create.assert_not_called()
 
+    def test_native_udp_enum_policy_verifies_without_recreation(self):
+        spec = qos.build_policy_specs("Test Game", "game.exe", None,
+                                      remote_ip="8.8.8.8", remote_port=27020)[0]
+        output = json.dumps({
+            "Name": spec["name"].lower(), "AppPathNameMatchCondition": "game.exe",
+            "IPProtocolMatchCondition": 2, "DSCPAction": 46,
+            "IPDstPrefixMatchCondition": "8.8.8.8/32",
+            "IPDstPortStartMatchCondition": 27020, "IPDstPortEndMatchCondition": 27020,
+            "IPSrcPortStartMatchCondition": 0, "IPSrcPortEndMatchCondition": 0,
+        })
+        with patch.object(qos, "_run_powershell", return_value=(True, output)) as query, \
+                patch.object(qos, "_create_policy") as create, \
+                patch.object(qos, "remove_qos_policy_by_name") as remove:
+            self.assertTrue(qos.sync_qos_policies([spec]))
+            self.assertEqual(query.call_count, 1)
+            create.assert_not_called()
+            remove.assert_not_called()
+
+    def test_native_non_udp_protocols_do_not_match_udp_policy(self):
+        spec = qos.build_policy_specs("Test Game", "game.exe", None)[0]
+        actual = {"app": "game.exe", "dscp": 46}
+        for protocol in (0, 1, 3, 17, "TCP", "Both", "None"):
+            with self.subTest(protocol=protocol):
+                self.assertFalse(qos._policy_matches_spec({**actual, "protocol": protocol}, spec, 46))
+
     def test_corrupt_policy_query_is_not_an_empty_store(self):
         for output in ("not JSON", '[7]', '{}', '{"Name":"someone-else"}'):
             with self.subTest(output=output), patch.object(qos, "_run_powershell", return_value=(True, output)):
@@ -470,6 +495,55 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertLess(selected[0]["bytes_per_sec"], 4094)
         self.assertEqual(ignored, [])
+
+    def test_etw_ports_use_network_byte_order(self):
+        for port in (53, 7286, 27020, 50000, 65535):
+            with self.subTest(port=port):
+                raw = port.to_bytes(2, "big")
+                self.assertEqual(flow_etw._bytes_to_port(raw), port)
+                self.assertEqual(flow_etw._bytes_to_port(raw),
+                                 flow_etw._port_from_dword(int.from_bytes(raw, "little")))
+        for raw in (b"", b"\x01", b"\x00\x00"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(flow_etw._bytes_to_port(raw))
+
+    def test_raw_etw_send_and_receive_share_correct_endpoint(self):
+        clock = Clock(0)
+        for family, local, remote, event_ids in (
+            (socket.AF_INET, "192.168.1.2", "8.8.8.8", (42, 43)),
+            (socket.AF_INET6, "2001:4860:1::2", "2001:4860:4860::8888", (58, 59)),
+        ):
+            with self.subTest(family=family):
+                collector = self.collector(clock)
+                collector.running = collector.available = True
+                collector.local_ips = {local}
+                for second in (0, 1, 3):
+                    clock.value = second
+                    for event_id in event_ids:
+                        sending = event_id in flow_etw.SEND_EVENT_IDS
+                        payload = {
+                            "PID": (102).to_bytes(4, "little"),
+                            "size": (200).to_bytes(4, "little"),
+                            "saddr": socket.inet_pton(family, local if sending else remote),
+                            "daddr": socket.inet_pton(family, remote if sending else local),
+                            "sport": (50000 if sending else 27020).to_bytes(2, "big"),
+                            "dport": (27020 if sending else 50000).to_bytes(2, "big"),
+                        }
+                        event = flow_etw.EVENT_RECORD()
+                        event.EventHeader.EventDescriptor.Id = event_id
+                        event.EventHeader.ProcessId = 777
+                        with patch.object(collector, "_property_raw", side_effect=lambda _, name, *a: payload[name]):
+                            collector._on_event(ctypes.pointer(event))
+                selected, _ = monitor.build_connection_report(DETECTED, collector)
+                self.assertEqual(len(selected), 1)
+                connection = selected[0]
+                self.assertEqual((connection["pid"], connection["remote_ip"],
+                                  connection["remote_port"], connection["local_port"]),
+                                 (102, remote, 27020, 50000))
+                spec = app._build_policy_specs(DETECTED, selected,
+                    local_tagging_mode=cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS)[0]
+                self.assertEqual(spec["dst_port"], 27020)
+                self.assertEqual(next(iter(collector.flows.values()))["packets"], 6)
 
     def test_recent_rate_does_not_include_old_bursts(self):
         clock = Clock(0)

@@ -170,7 +170,8 @@ def _policy_matches_spec(policy, spec, dscp_value):
 
     return (
         _exe_matches_policy(policy.get("app"), spec.get("exe"))
-        and protocol in ("udp", "17")
+        # NetQos Protocol.UDP serializes as 2, not the IP protocol number 17.
+        and protocol in ("udp", "2")
         and active_dscp == int(dscp_value)
         and _active_prefix_matches_spec(policy, spec)
         and _active_port_matches_spec(policy, "dst", spec.get("dst_port"))

@@ -28,9 +28,8 @@ marking or hardware performance. No deployment or release was performed.
 
 - Run the packaged app on an administrator Windows account. Confirm startup,
   settings/game-editor errors, tray exit and Task Scheduler rollback behavior.
-- Confirm ETW PID attribution and port decoding on real game traffic. Interrupt
-  telemetry and confirm recovery. No port byte-order change was made without
-  live evidence.
+- Confirm ETW PID attribution and corrected port decoding on real game traffic.
+  Interrupt telemetry and confirm recovery.
 - Capture packets to verify DSCP marking for multiple executables and exact
   flows. Remove a managed policy during a game and confirm repair after the
   periodic check; exercise actual native query failures and slow exit cleanup.
@@ -46,3 +45,23 @@ as partial. Forced process termination and unavailable native/router cleanup can
 still leave rules until another cleanup or router expiry. Live multi-user and
 multi-PC concurrency, dependency vulnerability scans and EXE packaging were not
 tested locally.
+
+## Flow-detection follow-up
+
+The v1.0.11 Valorant log showed destination ports 35945 and 30236 and repeated
+policy recreation. Two bugs were reproduced and fixed:
+
+- ETW network ports were read as little-endian. They now use network byte order,
+  consistent with Microsoft's UDP trace decoder. Regression cases reproduce
+  27020 becoming 35945 and 7286 becoming 30236 before the fix. Raw IPv4 and IPv6
+  send/receive events now preserve the same remote endpoint and local port
+  through the collector, connection report and exact-flow policy builder.
+- Windows NetQos serializes `Protocol.UDP` as `2`, while verification accepted
+  the IP protocol number `17`. The installed Windows module independently
+  produced `{"IPProtocolMatchCondition":2}`. Verification now accepts the native
+  UDP enum and rejects TCP, Both and invalid values, preventing false repair
+  loops for valid policies.
+
+All 58 tests passed locally on 2026-10-10. The existing installed agent was not
+restarted or modified. Live `Get-NetQosPolicy` access required an elevated Windows
+administrator process, so actual policy and DSCP packet checks remain pending.

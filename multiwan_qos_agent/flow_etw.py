@@ -396,11 +396,9 @@ def _bytes_to_int(raw):
 def _bytes_to_port(raw):
     if len(raw) < 2:
         return None
-    little = int.from_bytes(raw[:2], "little", signed=False)
-    if 1 <= little <= 65535:
-        return little
-    big = int.from_bytes(raw[:2], "big", signed=False)
-    return big if 1 <= big <= 65535 else None
+    # ETW network ports use network byte order, unlike PID and size fields.
+    port = int.from_bytes(raw[:2], "big", signed=False)
+    return port if 1 <= port <= 65535 else None
 
 
 def _port_from_dword(value):
