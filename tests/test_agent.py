@@ -485,16 +485,16 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(monitor.get_process_connections([102]), [])
             process.assert_not_called()
 
-    def test_low_bandwidth_active_flow_is_selected(self):
+    def test_low_bandwidth_active_flow_is_ignored_by_default(self):
         clock = Clock(0)
         collector = self.collector(clock)
         for second in (0, 1, 3):
             clock.value = second
             self.packet(collector)
         selected, ignored = collector.select_for_pids([102])
-        self.assertEqual(len(selected), 1)
-        self.assertLess(selected[0]["bytes_per_sec"], 4094)
-        self.assertEqual(ignored, [])
+        self.assertEqual(selected, [])
+        self.assertLess(ignored[0]["bytes_per_sec"], 4094)
+        self.assertEqual(ignored[0]["ignored_reason"], "low throughput")
 
     def test_etw_ports_use_network_byte_order(self):
         for port in (53, 7286, 27020, 50000, 65535):
@@ -523,7 +523,7 @@ class AgentTests(unittest.TestCase):
                         sending = event_id in flow_etw.SEND_EVENT_IDS
                         payload = {
                             "PID": (102).to_bytes(4, "little"),
-                            "size": (200).to_bytes(4, "little"),
+                            "size": (3000).to_bytes(4, "little"),
                             "saddr": socket.inet_pton(family, local if sending else remote),
                             "daddr": socket.inet_pton(family, remote if sending else local),
                             "sport": (50000 if sending else 27020).to_bytes(2, "big"),
@@ -554,19 +554,40 @@ class AgentTests(unittest.TestCase):
         for second in (46, 47, 50):
             clock.value = second
             self.packet(collector, 200)
-        selected, _ = collector.select_for_pids([102])
+        selected, _ = collector.select_for_pids([102], min_bps=0, top_ratio=0)
         self.assertEqual(len(selected), 1)
         self.assertAlmostEqual(selected[0]["bytes_per_sec"], 600 / 45)
 
-    def test_recent_activity_admits_small_flow_beside_large_flow(self):
+    def test_default_selection_filters_auxiliary_flows(self):
+        clock = Clock(0)
+        collector = self.collector(clock)
+        collector.available = True
+        for second in (0, 1, 3):
+            clock.value = second
+            for remote, size, count in (("8.8.8.8", 1000, 10), ("1.1.1.1", 1000, 5),
+                                        ("9.9.9.9", 500, 9), ("208.67.222.222", 200, 1)):
+                for _ in range(count):
+                    self.packet(collector, size, remote=remote)
+        selected, ignored = collector.select_for_pids([102])
+        self.assertEqual({f["remote_ip"] for f in selected}, {"8.8.8.8", "1.1.1.1"})
+        self.assertEqual({f["remote_ip"]: f["ignored_reason"] for f in ignored},
+                         {"9.9.9.9": "below top flow ratio", "208.67.222.222": "low throughput"})
+        report, candidates = monitor.build_connection_report(DETECTED, collector)
+        self.assertEqual({f["remote_ip"] for f in report}, {"8.8.8.8", "1.1.1.1"})
+        self.assertEqual(len(candidates), 4)
+        specs = app._build_policy_specs(DETECTED, report,
+            local_tagging_mode=cfg.LOCAL_TAGGING_MODE_LIVE_FLOWS)
+        self.assertEqual({s["dst_prefix"] for s in specs}, {"8.8.8.8/32", "1.1.1.1/32"})
+
+    def test_default_selection_ranks_bandwidth_before_packet_rate(self):
         clock = Clock(0)
         collector = self.collector(clock)
         for second in (0, 1, 3):
             clock.value = second
-            self.packet(collector, 200)
-            self.packet(collector, 1200, remote="1.1.1.1")
-        selected, _ = collector.select_for_pids([102])
-        self.assertEqual({f["remote_ip"] for f in selected}, {"8.8.8.8", "1.1.1.1"})
+            for _ in range(9): self.packet(collector, 1000)
+            for _ in range(20): self.packet(collector, 300, remote="1.1.1.1")
+        selected, _ = collector.select_for_pids([102], max_flows=1)
+        self.assertEqual([f["remote_ip"] for f in selected], ["8.8.8.8"])
 
     def test_stale_flows_are_not_selected(self):
         clock = Clock(0)

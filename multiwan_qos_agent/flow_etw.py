@@ -28,8 +28,9 @@ logger = logging.getLogger("multiwan_qos_agent.flow_etw")
 WINDOW_SECONDS = 45
 MIN_FLOW_AGE = 3
 STALE_SECONDS = 15
-MIN_BYTES_PER_SECOND = 0
-TOP_FLOW_RATIO = 0
+# Intentional: select significant game flows, not every game-owned UDP endpoint.
+MIN_BYTES_PER_SECOND = 4094
+TOP_FLOW_RATIO = 0.50
 MAX_SELECTED_FLOWS = 3
 
 IGNORED_UDP_PORTS = {
@@ -952,7 +953,7 @@ class EtwFlowCollector:
             else:
                 ranked.append(flow)
 
-        ranked.sort(key=lambda item: (item["packets_per_sec"], item["bytes_per_sec"]), reverse=True)
+        ranked.sort(key=lambda item: item["bytes_per_sec"], reverse=True)
         if not ranked:
             return [], ignored
 

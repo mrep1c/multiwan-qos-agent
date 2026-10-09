@@ -34,13 +34,20 @@ state is verified after changes and checked every 60 seconds to repair missing
 or changed policies. Changing the router address, credentials, TLS setting or
 PC address forces a fresh router synchronization.
 
-Flow selection uses recent packet activity and bandwidth over a 45-second
-window. A flow needs three packets and three seconds of observation; there is
-no default minimum bandwidth or fraction-of-largest-flow cutoff. The existing
-limit of three selected flows per game remains. ETW retries use delays bounded
+Flow selection ranks recent bandwidth over a 45-second window. A flow needs
+three packets, three seconds of observation and at least 4,094 bytes/second.
+Additional selected flows must reach at least 50% of the busiest eligible flow's
+bandwidth. Up to three flows per game are selected. ETW retries use delays bounded
 between 5 and 60 seconds. Windows psutil UDP tables cannot provide remote
 endpoints, so router flow detection requires working ETW telemetry; default
 all-UDP local tagging still works when ETW is unavailable.
+
+The throughput minimum, bandwidth ranking, 50% cutoff and three-flow cap are
+intentional selection rules. Game process ownership alone does not qualify a
+connection. Audits and refactors must preserve these rules unless a selection
+design change is explicitly requested. The dashboard may show ignored
+candidates for diagnosis; only selected flows reach the router report and
+exact-flow policy builder. See [AGENTS.md](AGENTS.md).
 
 The agent sends connection metadata needed for router QoS rules. It does not
 inspect packet payloads.

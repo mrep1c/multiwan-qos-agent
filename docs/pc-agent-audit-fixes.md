@@ -16,7 +16,7 @@ marking or hardware performance. No deployment or release was performed.
 | 7 | DPAPI is required to save nonempty credentials. Failure preserves the previous config and reports an error. Unreadable encrypted keys generate startup warnings and prevent automatic overwrite. | `test_encryption_failures_preserve_existing_file`, `test_key_is_encrypted_before_successful_save`, `test_unreadable_key_is_not_overwritten_during_startup` |
 | 8 | Custom labels meet router constraints, duplicate names are rejected, and executable paths become validated basenames. | `test_custom_form_validates_names_and_normalizes_paths`, `test_invalid_custom_entries_do_not_crash_or_replace_good_data` |
 | 9 | Unexpected ETW consumer exits mark telemetry unavailable. Automatic retries use bounded backoff and wait for the old consumer to stop. Windows no longer claims a psutil remote-UDP fallback. | `test_etw_exit_marks_unavailable_and_retries_with_backoff`, `test_etw_successful_retry_recovers`, `test_etw_retry_waits_for_old_consumer_to_stop`, `test_unexpected_clean_etw_exit_is_unavailable`, `test_windows_does_not_claim_a_psutil_udp_fallback` |
-| 10 | Per-second buckets measure recent traffic within 45 seconds. Recent packet activity ranks eligible flows; default bandwidth and largest-flow-ratio cutoffs are removed. Three-packet/three-second warmup, staleness checks and the three-flow cap remain. | `test_low_bandwidth_active_flow_is_selected`, `test_recent_rate_does_not_include_old_bursts`, `test_recent_activity_admits_small_flow_beside_large_flow`, `test_stale_flows_are_not_selected` |
+| 10 | Per-second buckets measure recent traffic within 45 seconds. At the user's request, bandwidth ranking and the original 4,094 bytes/second minimum and 50% largest-flow cutoff are restored. Three-packet/three-second warmup, staleness checks and the three-flow cap remain. | `test_low_bandwidth_active_flow_is_ignored_by_default`, `test_recent_rate_does_not_include_old_bursts`, `test_default_selection_filters_auxiliary_flows`, `test_default_selection_ranks_bandwidth_before_packet_rate`, `test_stale_flows_are_not_selected` |
 | 11 | A pending verification-recovery clear is serviced with active flows, then current flows are republished. | `test_active_verification_failure_clears_then_republishes` |
 | 12 | Router address, credentials, TLS choice and PC address invalidate cached success. Address changes attempt cleanup at the previous destination before publishing current flows. Shutdown remembers the last contacted destination. | `test_target_change_clears_old_target_and_updates_immediately`, `test_pc_address_change_republishes_current_flows`, `test_shutdown_uses_last_contacted_router_and_pc_address` |
 | 13 | Actual Windows policies are checked every 60 seconds and repaired if missing or changed. A verified unchanged set needs one query; failed verification retries. | `test_local_policy_audit_is_periodic_not_every_scan`, `test_verified_policy_sync_and_periodic_fast_path`, `test_failed_local_policy_verification_is_retried` |
@@ -65,3 +65,17 @@ policy recreation. Two bugs were reproduced and fixed:
 All 58 tests passed locally on 2026-10-10. The existing installed agent was not
 restarted or modified. Live `Get-NetQosPolicy` access required an elevated Windows
 administrator process, so actual policy and DSCP packet checks remain pending.
+
+## Selection rollback
+
+The audit's relaxed default selection admitted auxiliary game connections that
+the user expected to be filtered. The original minimum of 4,094 bytes/second,
+50% of the busiest eligible flow and bandwidth ranking are restored. The
+45-second recent-rate measurement and the v1.0.12 decoder and policy fixes are
+preserved. Regression coverage verifies that excluded auxiliary endpoints do
+not reach the router report or exact-flow policy builder. All 59 tests passed
+locally on 2026-10-10; live match-server selection remains unchecked.
+
+These filters are intentional design, not defects. Repository `AGENTS.md`,
+selection comments and regression tests now record that audits and refactors
+must preserve them unless the user explicitly requests a selection change.
