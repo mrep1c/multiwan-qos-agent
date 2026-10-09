@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,6 +13,8 @@ jobs:
   bump:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.bump.outputs.release_ref }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,10 +22,15 @@ jobs:
           fetch-depth: 0
 
       - name: Bump Windows agent version when app changes
+        id: bump
         shell: pwsh
         run: |
           $before = "${{ github.event.before }}"
           $head = "${{ github.sha }}"
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            "release_ref=$head" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           if ($before -match '^0+$') {
             $before = "HEAD^"
           }
@@ -34,6 +42,7 @@ jobs:
 
           if ($changed | Where-Object { $versionFiles -contains $_ }) {
             Write-Host "Version file changed in this push; skipping auto bump."
+            "release_ref=$head" >> $env:GITHUB_OUTPUT
             exit 0
           }
 
@@ -69,4 +78,17 @@ jobs:
           }
 
           git commit -m "Bump Windows agent version to $newVersion"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to commit version $newVersion" }
           git push
+          if ($LASTEXITCODE -ne 0) { throw "Failed to push version $newVersion" }
+          $releaseRef = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve the bumped commit" }
+          "release_ref=$releaseRef" >> $env:GITHUB_OUTPUT
+
+  release:
+    needs: bump
+    if: needs.bump.outputs.release_ref != ''
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      ref: ${{ needs.bump.outputs.release_ref }}
+      publish_release: true

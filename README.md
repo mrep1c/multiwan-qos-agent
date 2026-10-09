@@ -99,9 +99,10 @@ Download the Windows release from:
 https://github.com/mrep1c/multiwan-qos-agent/releases
 ```
 
-Tagged releases are built by GitHub Actions and include a ready-to-run Windows
-EXE asset. Non-release workflow runs also publish the EXE as a workflow
-artifact.
+App changes pushed to `main` automatically bump the version, run the regression
+tests, build the Windows EXE and publish a GitHub Release at the exact bumped
+commit. Explicit version updates also publish automatically. Non-release builds
+still upload the EXE as a workflow artifact.
 
 Release asset naming:
 
@@ -229,7 +230,13 @@ The Windows build output is created under `dist\`.
 
 GitHub Actions also builds the EXE automatically on pushes to `main`, on
 manual workflow runs, and on version tags such as `v1.0.4`. Version tags attach
-the EXE to the matching GitHub Release.
+the EXE to the matching GitHub Release. The version workflow directly calls the
+same tested build workflow after a successful bump; it does not depend on the
+bot's push triggering another workflow. Releases publish only after tests and
+packaging succeed. Documentation-only changes do not publish a new version, and
+existing release assets are preserved on reruns.
+To publish the current version without another bump, run `Auto Bump Version`
+manually from GitHub Actions. The same test and build gates apply.
 
 ## Troubleshooting
 
