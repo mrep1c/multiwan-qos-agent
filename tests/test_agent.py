@@ -144,7 +144,8 @@ class AgentTests(unittest.TestCase):
         collector.local_ips = {"192.168.1.2"}
         collector.set_tracked_pids([102])
         collector.owner_map = types.SimpleNamespace(refresh=lambda: None,
-            pids_for_port=lambda port: {102} if port == 50000 else set())
+            pids_for_port=lambda port: {102} if port == 50000 else set(),
+            pids_for_endpoint=lambda address, port: {102} if port == 50000 else set())
         self.stack.enter_context(patch.object(flow_etw, "time", clock))
         return collector
 
@@ -183,7 +184,7 @@ class AgentTests(unittest.TestCase):
 
     def test_verified_policy_sync_and_periodic_fast_path(self):
         spec = qos.build_policy_specs("Test Game", "game.exe", None)[0]
-        actual = {"name": spec["name"], "app": "game.exe", "protocol": "UDP", "dscp": 46}
+        actual = {"name": spec["name"], "app": "game.exe", "protocol": "UDP", "dscp": 46, "network_profile": 7}
         with patch.object(qos, "get_active_policies", side_effect=[[], [actual]]), \
                 patch.object(qos, "_create_policy", return_value=True):
             self.assertTrue(qos.sync_qos_policies([spec]))
@@ -198,6 +199,7 @@ class AgentTests(unittest.TestCase):
         output = json.dumps({
             "Name": spec["name"].lower(), "AppPathNameMatchCondition": "game.exe",
             "IPProtocolMatchCondition": 2, "DSCPAction": 46,
+            "NetworkProfile": 7, "IPSrcPrefixMatchCondition": "",
             "IPDstPrefixMatchCondition": "",
             "IPDstPortStartMatchCondition": 27020, "IPDstPortEndMatchCondition": 27020,
             "IPSrcPortStartMatchCondition": 0, "IPSrcPortEndMatchCondition": 0,
@@ -232,7 +234,7 @@ class AgentTests(unittest.TestCase):
     def test_selected_port_verification_still_checks_native_conditions(self):
         spec = qos.build_policy_specs("Test", "game.exe", None,
             remote_ip="162.249.75.1", remote_port=7114)[0]
-        actual = {"app": "game.exe", "protocol": 2, "dscp": 46,
+        actual = {"app": "game.exe", "protocol": 2, "dscp": 46, "network_profile": 7,
                   "dst_prefix": "", "dst_port_start": 7114, "dst_port_end": 7114}
         self.assertTrue(qos._policy_matches_spec(actual, spec, 46))
         for field, value in (("app", "other.exe"), ("protocol", 1), ("dscp", 0),
@@ -245,7 +247,7 @@ class AgentTests(unittest.TestCase):
         spec = qos.build_policy_specs("Test", "game.exe", None,
             remote_ip="162.249.75.1", remote_port=7114)[0]
         legacy_name = qos._policy_name("Test", "game.exe", dst_prefix="162.249.75.1/32", dst_port=7114)
-        actual = {"name": spec["name"], "app": "game.exe", "protocol": 2, "dscp": 46,
+        actual = {"name": spec["name"], "app": "game.exe", "protocol": 2, "dscp": 46, "network_profile": 7,
                   "dst_prefix": "", "dst_port_start": 7114, "dst_port_end": 7114}
         with patch.object(qos, "get_active_policies", side_effect=[[{**actual, "name": legacy_name}], [actual], [actual]]), \
                 patch.object(qos, "remove_qos_policy_by_name", return_value=True) as remove, \
@@ -659,7 +661,8 @@ class AgentTests(unittest.TestCase):
         clock = Clock()
         collector = self.collector(clock)
         collector.owner_map = types.SimpleNamespace(refresh=lambda: None,
-            pids_for_port=lambda port: {777} if port == 50000 else set())
+            pids_for_port=lambda port: {777} if port == 50000 else set(),
+            pids_for_endpoint=lambda address, port: {777} if port == 50000 else set())
         self.packet(collector, pid=777)
         self.assertEqual(collector.flows, {})
 
@@ -681,7 +684,7 @@ class AgentTests(unittest.TestCase):
         self.packet(collector, pid=0)
         self.assertEqual({f["pid"] for f in collector.flows.values()}, {102})
 
-    def test_flow_pruning_is_bounded_and_port_changes_use_index(self):
+    def test_flow_pruning_is_bounded(self):
         clock = Clock()
         collector = self.collector(clock)
         class CountedDict(dict):
@@ -693,6 +696,134 @@ class AgentTests(unittest.TestCase):
         for _ in range(1000): self.packet(collector)
         self.assertEqual(collector.flows.scans, 1)
         self.assertEqual(len(next(iter(collector.flows.values()))["samples"]), 1)
+
+    def test_concurrent_sockets_keep_independent_warmup(self):
+        clock = Clock(0)
+        collector = self.collector(clock)
+        for second in range(12):
+            clock.value = second
+            for port in (50000, 50001):
+                collector.record(102, 42, 6000, "192.168.1.2", port, "8.8.8.8", 27015)
+        selected, _ = collector.select_for_pids([102])
+        self.assertEqual({flow["local_port"] for flow in selected}, {50000, 50001})
+        self.assertEqual({flow["packets"] for flow in selected}, {12})
+
+    def test_local_address_beats_unrelated_remote_port_owner(self):
+        clock = Clock(0)
+        collector = self.collector(clock)
+        collector.owner_map = types.SimpleNamespace(refresh=lambda: None,
+            pids_for_port=lambda port: {777} if port == 27015 else set(),
+            pids_for_endpoint=lambda address, port: set())
+        for second in (0, 1, 3):
+            clock.value = second
+            collector.record(102, 42, 6000, "192.168.1.2", 50001, "8.8.8.8", 27015)
+        selected, _ = collector.select_for_pids([102])
+        self.assertEqual([(flow["remote_ip"], flow["local_port"]) for flow in selected], [("8.8.8.8", 50001)])
+
+    def test_missing_payload_pid_does_not_trust_another_tracked_header(self):
+        collector = self.collector(Clock())
+        collector.running = True
+        collector.set_tracked_pids([102, 103])
+        collector.owner_map.pids_for_endpoint = lambda address, port: {102} if port == 50000 else set()
+        payload = {"PID": b"", "size": (6000).to_bytes(4, "little"),
+            "saddr": socket.inet_aton("192.168.1.2"), "daddr": socket.inet_aton("8.8.8.8"),
+            "sport": (50000).to_bytes(2, "big"), "dport": (27015).to_bytes(2, "big")}
+        event = flow_etw.EVENT_RECORD()
+        event.EventHeader.EventDescriptor.Id = 42
+        event.EventHeader.ProcessId = 103
+        with patch.object(collector, "_property_raw", side_effect=lambda _, name, *a: payload[name]):
+            collector._on_event(ctypes.pointer(event))
+        self.assertEqual({flow["pid"] for flow in collector.flows.values()}, {102})
+
+    def test_missing_pid_with_ambiguous_socket_owner_is_ignored(self):
+        collector = self.collector(Clock())
+        collector.set_tracked_pids([102, 103])
+        collector.owner_map = types.SimpleNamespace(refresh=lambda: None,
+            pids_for_port=lambda port: {102, 103} if port == 50000 else set(),
+            pids_for_endpoint=lambda address, port: {102, 103} if port == 50000 else set())
+        self.packet(collector, pid=0)
+        self.assertEqual(collector.flows, {})
+
+    def test_native_socket_owners_keep_address_and_family_boundaries(self):
+        owner = flow_etw.UdpOwnerMap()
+        tables = {}
+        for family, row_type, entries in (
+            (flow_etw.AF_INET, flow_etw.MIB_UDPROW_OWNER_PID,
+             [("192.168.1.2", 50000, 102), ("192.168.1.3", 50000, 103), ("0.0.0.0", 50001, 104)]),
+            (flow_etw.AF_INET6, flow_etw.MIB_UDP6ROW_OWNER_PID,
+             [("2001:4860:1::2", 50000, 105), ("::", 50001, 106)]),
+        ):
+            rows = []
+            for address, port, pid in entries:
+                row = row_type()
+                row.dwOwningPid = pid
+                row.dwLocalPort = int.from_bytes(port.to_bytes(2, "big"), "little")
+                if family == flow_etw.AF_INET:
+                    row.dwLocalAddr = int.from_bytes(socket.inet_aton(address), "little")
+                else:
+                    row.ucLocalAddr[:] = socket.inet_pton(socket.AF_INET6, address)
+                rows.append(bytes(row))
+            tables[family] = bytes(ctypes.wintypes.DWORD(len(rows))) + b"".join(rows)
+        def native_query(buffer, size, _sort, family, _class, _reserved):
+            data = tables[family]
+            ctypes.cast(size, ctypes.POINTER(ctypes.wintypes.ULONG)).contents.value = len(data)
+            if buffer is None:
+                return flow_etw.ERROR_INSUFFICIENT_BUFFER
+            ctypes.memmove(buffer, data, len(data))
+            return flow_etw.ERROR_SUCCESS
+        owner.iphlpapi = types.SimpleNamespace(GetExtendedUdpTable=native_query)
+        with patch.object(flow_etw, "time", Clock()), patch.object(flow_etw.os, "name", "nt"):
+            self.assertEqual(owner.pids_for_endpoint("192.168.1.2", 50000), {102})
+            self.assertEqual(owner.pids_for_endpoint("192.168.1.3", 50000), {103})
+            self.assertEqual(owner.pids_for_endpoint("192.168.1.4", 50000), set())
+            self.assertEqual(owner.pids_for_endpoint("2001:4860:1::2", 50000), {105})
+            self.assertEqual(owner.pids_for_endpoint("192.168.1.2", 50001), {104})
+            self.assertEqual(owner.pids_for_endpoint("2001:4860:1::2", 50001), {106})
+
+    def test_same_port_on_different_local_addresses_keeps_history(self):
+        clock = Clock(0)
+        collector = self.collector(clock)
+        collector.local_ips.add("192.168.1.3")
+        for second in (0, 1, 3):
+            clock.value = second
+            for local_ip in collector.local_ips:
+                collector.record(102, 42, 6000, local_ip, 50000, "8.8.8.8", 27015)
+        selected, _ = collector.select_for_pids([102])
+        self.assertEqual({flow["local_ip"] for flow in selected}, collector.local_ips)
+        self.assertEqual({flow["packets"] for flow in selected}, {3})
+
+    def test_policy_verifier_rejects_hidden_or_malformed_restrictions(self):
+        spec = qos.build_policy_specs("Test", "game.exe", None)[0]
+        actual = {"app": "game.exe", "protocol": 2, "dscp": 46, "network_profile": 7,
+                  "src_prefix": "", "dst_prefix": ""}
+        self.assertTrue(qos._policy_matches_spec(actual, spec, 46))
+        for change in ({"src_prefix": "10.42.0.0/24"}, {"network_profile": 1},
+                       {"dst_prefix": "bad-prefix"}, {"src_prefix": "bad-prefix"},
+                       {"dst_port": "bad-port"}, {"src_port_start": 65536},
+                       {"dst_port": True}, {"dst_port": float("inf")}):
+            with self.subTest(change=change):
+                self.assertFalse(qos._policy_matches_spec({**actual, **change}, spec, 46))
+
+    def test_policy_query_includes_source_prefix_and_all_network_profiles(self):
+        output = json.dumps({"Name": "MultiWANQoSAgent_Test", "IPSrcPrefixMatchCondition": "10.42.0.0/24",
+                             "NetworkProfile": 4})
+        with patch.object(qos, "_run_powershell", return_value=(True, output)) as query:
+            policy = qos.get_active_policies()[0]
+        self.assertEqual(policy["src_prefix"], "10.42.0.0/24")
+        self.assertEqual(policy["network_profile"], 4)
+        self.assertIn("IPSrcPrefixMatchCondition, NetworkProfile", query.call_args.args[0])
+
+    def test_native_wildcards_and_single_port_ranges_verify_without_churn(self):
+        spec = qos.build_policy_specs("Test", "game.exe", None)[0]
+        actual = {"app": "game.exe", "protocol": 2, "dscp": 46, "network_profile": 7}
+        for wildcard in (None, "", "Any", "*", 0, "0"):
+            with self.subTest(wildcard=wildcard):
+                self.assertTrue(qos._policy_matches_spec({**actual, "dst_port": wildcard}, spec, 46))
+        selected = qos.build_policy_specs("Test", "game.exe", None, remote_ip="8.8.8.8", remote_port=27015)[0]
+        self.assertTrue(qos._policy_matches_spec({**actual, "dst_port_start": 27015, "dst_port_end": 27015}, selected, 46))
+        self.assertFalse(qos._policy_matches_spec({**actual, "dst_port": 27015,
+            "dst_port_start": 27014, "dst_port_end": 27016}, selected, 46))
+        self.assertFalse(qos._policy_matches_spec({**actual, "network_profile": None}, spec, 46))
 
     def test_active_verification_failure_clears_then_republishes(self):
         replies = iter([sync.SyncResult(False, "router verification mismatch"), sync.SyncResult(True, "OK", rule_count=2)])

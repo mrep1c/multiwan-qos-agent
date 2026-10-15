@@ -32,6 +32,9 @@ systems; the UI must state that Windows cannot match the server IP. Other UDP
 traffic from the same executable to that port can also be tagged. Router rules
 must retain the exact selected endpoints, including IP addresses and ports.
 
+Never create a port-only Windows policy. The executable condition is mandatory
+in every agent policy, including fallback behavior and diagnostic fixes.
+
 Keep Windows policies temporary in ActiveStore. Do not add an IP condition that
 causes repeated failed verification, silently accept an unmet desired condition,
 or switch to persistent policies without an explicit user request. Flows sharing

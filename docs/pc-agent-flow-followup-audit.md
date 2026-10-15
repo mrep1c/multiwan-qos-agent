@@ -3,8 +3,9 @@
 Reviewed on 2026-10-10 against v1.0.12, commit
 `eb4439ab3b0425d174c9090037945fa908f948e8`. This review covers endpoint decoding,
 direction, PID fallback, simultaneous sockets, selection and native policy
-verification. The additional findings below remain unfixed; no running agent,
-Windows policy or router configuration was changed during this audit.
+verification. The reproduced findings below were fixed in source on 2026-10-16.
+The descriptions and line numbers record the original audit. No running agent,
+Windows policy or router configuration was changed during this source work.
 
 The earlier ETW port byte-order and NetQos UDP enum fixes are published in
 v1.0.12. Its release workflow succeeded, including all 58 regression tests.
@@ -79,7 +80,7 @@ rollback restores those defaults while retaining recent-rate measurement.
 Future audits must follow repository `AGENTS.md` and must not relax selection
 without an explicit user request.
 
-- `flow_etw.py:961`: The three-flow cap uses recent packet rate and bandwidth.
+- The three-flow cap ranks eligible flows by recent bandwidth.
   Three more-active auxiliary UDP flows from the same game process can exclude
   its gameplay flow. Without traffic classification or session evidence,
   activity alone cannot guarantee which endpoint is the match server.
@@ -98,3 +99,26 @@ These additional cases have not been tested during a live game. Administrator
 access to the actual Windows policy store and DSCP packet capture remain
 unchecked. No claim is made that these findings explain the user's entire live
 symptom; the expected match-server endpoint was not supplied.
+
+## Resolution on 2026-10-16
+
+All four reproduced findings are fixed:
+
+- Each complete socket tuple keeps independent history, including its local
+  address. Another socket no longer deletes its warmup and recent samples.
+- Known local addresses determine direction before socket-owner heuristics.
+- Missing payload PID uses a unique local family/address/port owner. Header PID
+  is not used as process identity, and ambiguous owners do not duplicate events.
+- Native policy verification checks source prefixes and all-profile scope,
+  rejects malformed restrictions and conflicting port ranges, and accepts the
+  native wildcard and single-port representations used by NetQos.
+
+Regression coverage includes decoded ETW events, concurrent warm sockets,
+address/family boundaries in mocked native UDP tables, and policy repair
+conditions. All 72 tests pass locally. The original 4,094 bytes/second minimum,
+bandwidth ranking, 50% cutoff, three-flow cap, 45-second recent window, warmup,
+stale and noise filters are preserved. Windows policies remain temporary and
+always require the executable; selected-port mode adds the selected UDP port.
+
+This verifies the source fixes with mocked native operations. Live gameplay,
+native policy effectiveness and packet DSCP require separate validation.

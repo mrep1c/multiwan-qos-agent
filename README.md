@@ -40,6 +40,10 @@ state is verified after changes and checked every 60 seconds to repair missing
 or changed policies. Changing the router address, credentials, TLS setting or
 PC address forces a fresh router synchronization.
 
+Verification checks source-address restrictions and all-network-profile scope,
+and rejects malformed or conflicting native port conditions. Every policy must
+retain an executable condition; selected-port mode never creates port-only rules.
+
 Flow selection ranks recent bandwidth over a 45-second window. A flow needs
 three packets, three seconds of observation and at least 4,094 bytes/second.
 Additional selected flows must reach at least 50% of the busiest eligible flow's
@@ -47,6 +51,11 @@ bandwidth. Up to three flows per game are selected. ETW retries use delays bound
 between 5 and 60 seconds. Windows psutil UDP tables cannot provide remote
 endpoints, so router flow detection requires working ETW telemetry; default
 all-UDP local tagging still works when ETW is unavailable.
+
+Concurrent sockets keep separate histories for each local address and port.
+Known local addresses take precedence when determining packet direction. Events
+without a payload PID require one unambiguous owner of the local address, address
+family and port; the event-header PID is not used as socket identity.
 
 The throughput minimum, bandwidth ranking, 50% cutoff and three-flow cap are
 intentional selection rules. Game process ownership alone does not qualify a

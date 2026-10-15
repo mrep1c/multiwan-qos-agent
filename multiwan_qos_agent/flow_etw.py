@@ -456,6 +456,7 @@ class UdpOwnerMap:
         self.iphlpapi = None
         self.pid_ports = {}
         self.port_pids = {}
+        self.endpoint_pids = {}
         self.last_refresh = 0
 
     def refresh(self, max_age=2.0):
@@ -470,19 +471,21 @@ class UdpOwnerMap:
 
         pid_ports = {}
         port_pids = {}
+        endpoint_pids = {}
         for family, row_type in (
             (AF_INET, MIB_UDPROW_OWNER_PID),
             (AF_INET6, MIB_UDP6ROW_OWNER_PID),
         ):
             try:
-                self._read_family(family, row_type, pid_ports, port_pids)
+                self._read_family(family, row_type, pid_ports, port_pids, endpoint_pids)
             except Exception:
                 logger.debug("Failed to read UDP owner table for family %s", family, exc_info=True)
 
         self.pid_ports = pid_ports
         self.port_pids = port_pids
+        self.endpoint_pids = endpoint_pids
 
-    def _read_family(self, family, row_type, pid_ports, port_pids):
+    def _read_family(self, family, row_type, pid_ports, port_pids, endpoint_pids):
         size = wintypes.ULONG(0)
         status = self.iphlpapi.GetExtendedUdpTable(
             None,
@@ -517,6 +520,9 @@ class UdpOwnerMap:
                 continue
             pid_ports.setdefault(pid, set()).add(port)
             port_pids.setdefault(port, set()).add(pid)
+            address = (socket.inet_ntop(socket.AF_INET, int(row.dwLocalAddr).to_bytes(4, "little"))
+                       if family == AF_INET else socket.inet_ntop(socket.AF_INET6, bytes(row.ucLocalAddr)))
+            endpoint_pids.setdefault((family, address, port), set()).add(pid)
 
     def ports_for_pids(self, pids):
         self.refresh()
@@ -529,6 +535,18 @@ class UdpOwnerMap:
         self.refresh()
         return set(self.port_pids.get(int(port), set()))
 
+    def pids_for_endpoint(self, address, port):
+        try:
+            ip = ipaddress.ip_address(address)
+            port = int(port)
+        except (ValueError, TypeError, OverflowError):
+            return set()
+        self.refresh()
+        family = AF_INET if ip.version == 4 else AF_INET6
+        wildcard = "0.0.0.0" if ip.version == 4 else "::"
+        return (set(self.endpoint_pids.get((family, str(ip), port), set())) |
+                set(self.endpoint_pids.get((family, wildcard, port), set())))
+
 
 class EtwFlowCollector:
     """Collect recent UDP telemetry and select flows by recent packet activity."""
@@ -539,7 +557,6 @@ class EtwFlowCollector:
         self.activity_event = threading.Event()
         self.tracked_pids = set()
         self.flows = {}
-        self.endpoint_keys = {}
         self.next_prune_at = 0
         self.next_start_at = 0
         self.retry_delay = 5
@@ -640,7 +657,6 @@ class EtwFlowCollector:
         self.session_handle = None
         with self.lock:
             self.flows.clear()
-            self.endpoint_keys.clear()
         return True
 
     def status(self):
@@ -663,7 +679,6 @@ class EtwFlowCollector:
             for key in list(self.flows):
                 if key[0] not in self.tracked_pids:
                     del self.flows[key]
-                    self.endpoint_keys.pop(key[:3], None)
 
     def _start_session(self):
         self.props_buffer, self.props = _new_properties()
@@ -788,8 +803,7 @@ class EtwFlowCollector:
                 self._property_raw(event_record, "dport", "DPort", "DestinationPort") or b""
             )
 
-            if not pid:
-                pid = int(header.ProcessId)
+            # Header PID is execution context, not a substitute for socket ownership.
             if not (size and saddr and daddr and sport and dport):
                 return
 
@@ -804,40 +818,39 @@ class EtwFlowCollector:
         remote_ip = None
         remote_port = None
         local_port = None
+        local_ip = None
         candidate_pid = int(pid) if pid else 0
+        if candidate_pid and candidate_pid not in self.tracked_pids:
+            return
 
         self.owner_map.refresh()
-        sport_owners = self.owner_map.pids_for_port(sport) if sport else set()
-        dport_owners = self.owner_map.pids_for_port(dport) if dport else set()
+        sport_owners = self.owner_map.pids_for_endpoint(saddr, sport) if sport else set()
+        dport_owners = self.owner_map.pids_for_endpoint(daddr, dport) if dport else set()
 
-        # Prefer the Windows UDP owner table over ETW field ordering. Some game
-        # UDP sockets are unconnected and some ETW templates expose local/remote
-        # values in a provider-specific order; the owned port is the PC-side
-        # local port, so the opposite port is the server port we need for nft/QoS.
-        if candidate_pid and candidate_pid in sport_owners and candidate_pid not in dport_owners:
-            local_port = sport
+        # A known local address wins over an unrelated socket with the server's port.
+        if saddr in self.local_ips and daddr not in self.local_ips:
+            local_ip, local_port = saddr, sport
+            remote_ip, remote_port = daddr, dport
+        elif daddr in self.local_ips and saddr not in self.local_ips:
+            local_ip, local_port = daddr, dport
+            remote_ip, remote_port = saddr, sport
+        elif candidate_pid and candidate_pid in sport_owners and candidate_pid not in dport_owners:
+            local_ip, local_port = saddr, sport
             remote_ip, remote_port = daddr, dport
         elif candidate_pid and candidate_pid in dport_owners and candidate_pid not in sport_owners:
-            local_port = dport
+            local_ip, local_port = daddr, dport
             remote_ip, remote_port = saddr, sport
         elif sport_owners and not dport_owners:
-            local_port = sport
+            local_ip, local_port = saddr, sport
             remote_ip, remote_port = daddr, dport
         elif dport_owners and not sport_owners:
-            local_port = dport
+            local_ip, local_port = daddr, dport
             remote_ip, remote_port = saddr, sport
-
-        if not remote_ip and saddr in self.local_ips and daddr not in self.local_ips:
-            local_port = sport
+        elif event_id in SEND_EVENT_IDS:
+            local_ip, local_port = saddr, sport
             remote_ip, remote_port = daddr, dport
-        elif not remote_ip and daddr in self.local_ips and saddr not in self.local_ips:
-            local_port = dport
-            remote_ip, remote_port = saddr, sport
-        elif not remote_ip and event_id in SEND_EVENT_IDS:
-            local_port = sport
-            remote_ip, remote_port = daddr, dport
-        elif not remote_ip and event_id in RECV_EVENT_IDS:
-            local_port = dport
+        elif event_id in RECV_EVENT_IDS:
+            local_ip, local_port = daddr, dport
             remote_ip, remote_port = saddr, sport
 
         if not remote_ip or not remote_port:
@@ -847,21 +860,15 @@ class EtwFlowCollector:
         if _is_noise_ip(remote_ip, self.local_ips):
             return
 
-        owner_pids = self.owner_map.pids_for_port(local_port) if local_port else set()
-        candidate_pids = ({candidate_pid} if candidate_pid in self.tracked_pids
-                          else owner_pids & self.tracked_pids)
+        owner_pids = self.owner_map.pids_for_endpoint(local_ip, local_port) if local_port else set()
+        candidate_pids = {candidate_pid} if candidate_pid else (owner_pids if len(owner_pids) == 1 else set())
         if not candidate_pids:
             return
 
         with self.lock:
             for candidate_pid in candidate_pids & self.tracked_pids:
                 local_port_id = int(local_port or 0)
-                key = (candidate_pid, remote_ip, int(remote_port), local_port_id)
-                if local_port_id:
-                    previous_key = self.endpoint_keys.get(key[:3])
-                    if previous_key != key:
-                        self.flows.pop(previous_key, None)
-                    self.endpoint_keys[key[:3]] = key
+                key = (candidate_pid, remote_ip, int(remote_port), local_port_id, local_ip)
                 flow = self.flows.get(key)
                 if not flow:
                     flow = {
@@ -869,6 +876,7 @@ class EtwFlowCollector:
                         "remote_ip": remote_ip,
                         "remote_port": int(remote_port),
                         "local_port": local_port_id,
+                        "local_ip": local_ip,
                         "bytes": 0,
                         "packets": 0,
                         "first_seen": now,
@@ -903,8 +911,6 @@ class EtwFlowCollector:
         ]
         for key in stale:
             del self.flows[key]
-            if self.endpoint_keys.get(key[:3]) == key:
-                del self.endpoint_keys[key[:3]]
 
     def select_for_pids(
         self,

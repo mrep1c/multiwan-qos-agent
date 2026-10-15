@@ -99,9 +99,11 @@ def _validate_exe_name(exe_name):
 
 
 def _normalize_port(value):
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return None
     try:
         port = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if 1 <= port <= 65535:
         return port
@@ -130,15 +132,23 @@ def _exe_matches_policy(policy_app, exe_name):
 
 
 def _active_prefix_matches_spec(policy, spec):
-    spec_prefix = spec.get("dst_prefix")
-    active_prefix = _normalize_ip_prefix(policy.get("dst_prefix"))
-    if spec_prefix is None:
-        return active_prefix is None
-    return active_prefix == spec_prefix
+    for field in ("dst_prefix", "src_prefix"):
+        expected = spec.get(field)
+        value = policy.get(field)
+        if expected is None:
+            if value is not None and (not isinstance(value, str) or value.strip().lower() not in ("", "any", "*")):
+                return False
+        elif _normalize_ip_prefix(value) != expected:
+            return False
+    return True
 
 
-def _has_port_match(value):
-    return _normalize_port(value) is not None
+def _wildcard_port(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("", "0", "any", "*")
+    return type(value) is int and value == 0
 
 
 def _active_port_matches_spec(policy, prefix, spec_port):
@@ -146,12 +156,16 @@ def _active_port_matches_spec(policy, prefix, spec_port):
     start = policy.get(f"{prefix}_port_start")
     end = policy.get(f"{prefix}_port_end")
 
+    if any(not _wildcard_port(value) and _normalize_port(value) is None for value in (exact, start, end)):
+        return False
+
     if spec_port is None:
-        return not any(_has_port_match(value) for value in (exact, start, end))
+        return all(_wildcard_port(value) for value in (exact, start, end))
 
     active_exact = _normalize_port(exact)
     if active_exact is not None:
-        return active_exact == spec_port
+        return active_exact == spec_port and all(
+            _wildcard_port(value) or _normalize_port(value) == spec_port for value in (start, end))
 
     active_start = _normalize_port(start)
     active_end = _normalize_port(end)
@@ -165,7 +179,7 @@ def _policy_matches_spec(policy, spec, dscp_value):
     protocol = str(policy.get("protocol") or "").lower()
     try:
         active_dscp = int(policy.get("dscp"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         active_dscp = None
 
     return (
@@ -173,6 +187,7 @@ def _policy_matches_spec(policy, spec, dscp_value):
         # NetQos Protocol.UDP serializes as 2, not the IP protocol number 17.
         and protocol in ("udp", "2")
         and active_dscp == int(dscp_value)
+        and str(policy.get("network_profile", "")).strip().lower() in ("all", "7")
         and _active_prefix_matches_spec(policy, spec)
         and _active_port_matches_spec(policy, "dst", spec.get("dst_port"))
         and _active_port_matches_spec(policy, "src", spec.get("src_port"))
@@ -476,7 +491,7 @@ def get_active_policies():
         f'Get-NetQosPolicy -PolicyStore {POLICY_STORE} | '
         f'Where-Object {{ $_.Name -like "{POLICY_PREFIX}*" }} '
         f"| Select-Object Name, AppPathNameMatchCondition, IPProtocolMatchCondition, "
-        f"IPDstPrefixMatchCondition, IPDstPortMatchCondition, "
+        f"IPDstPrefixMatchCondition, IPSrcPrefixMatchCondition, NetworkProfile, IPDstPortMatchCondition, "
         f"IPDstPortStartMatchCondition, IPDstPortEndMatchCondition, "
         f"IPSrcPortMatchCondition, IPSrcPortStartMatchCondition, "
         f"IPSrcPortEndMatchCondition, DSCPAction | ConvertTo-Json -Compress"
@@ -504,6 +519,8 @@ def get_active_policies():
                 "app": p.get("AppPathNameMatchCondition", ""),
                 "protocol": p.get("IPProtocolMatchCondition", ""),
                 "dst_prefix": p.get("IPDstPrefixMatchCondition", ""),
+                "src_prefix": p.get("IPSrcPrefixMatchCondition", ""),
+                "network_profile": p.get("NetworkProfile"),
                 "dst_port": p.get("IPDstPortMatchCondition", ""),
                 "dst_port_start": p.get("IPDstPortStartMatchCondition", ""),
                 "dst_port_end": p.get("IPDstPortEndMatchCondition", ""),

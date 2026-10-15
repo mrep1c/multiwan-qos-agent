@@ -108,3 +108,18 @@ and preservation of exact router metadata and selection filters. Live native
 creation, packet DSCP capture and GUI layout still require the packaged app.
 This fixes the confirmed verification loop; it does not establish the cause of
 the reported hit-registration problem.
+
+## Socket ownership and policy validation follow-up — 2026-10-16
+
+The four findings in [the flow follow-up audit](pc-agent-flow-followup-audit.md)
+are fixed. Concurrent sockets retain their histories; local addresses determine
+direction before ownership heuristics; missing payload PID requires a unique
+family/address/port owner rather than header PID or every numeric-port owner.
+Policy verification now checks source-prefix and all-profile conditions and
+rejects malformed or conflicting native port restrictions.
+
+All 72 local tests pass, including mocked native UDP table decoding and the
+existing release-workflow tests. Intentional flow selection is unchanged.
+Policies remain temporary executable-plus-selected-port policies in strict
+mode, or executable-plus-UDP policies in default mode. No port-only fallback is
+permitted. No running installation or native policy was changed for this work.
