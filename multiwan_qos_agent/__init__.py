@@ -1,7 +1,8 @@
 # MultiWAN QoS Agent
 """MultiWAN QoS Windows Agent — automatic game traffic prioritization."""
 
-__version__ = "1.0.14"
+__version__ = "1.0.15"
+
 
 
 
